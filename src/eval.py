@@ -3,6 +3,11 @@ import math
 import scipy.stats as st
 import xml.etree.ElementTree as ET
 
+def ranked_candidates(candidates):
+    """
+    Rank candidates deterministically: score desc, then target URI, to ensure reproducibility.
+    """
+    return sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
 
 def load_openea_ref(loc):
     gt_pairs = []
@@ -15,12 +20,12 @@ def load_openea_ref(loc):
 
 def openea_eval(maxAssignment, y_gold, save_path=None):
     y_pred = set()
-    for e1 in maxAssignment:
+    for e1 in sorted(maxAssignment):
         # if e1.startswith('dbr:'):
         if e1.startswith('http://dbpedia.org/resource/'):
-            for e2 in maxAssignment[e1]:
-                y_pred.add(tuple([e1, e2]))
-                break # only select the first one
+            ranked = ranked_candidates(maxAssignment[e1])
+            if ranked:
+                y_pred.add(tuple([e1, ranked[0][0]])) # only select the first one
     
     # calculate precision, recall, f1
     tp = len(y_gold.intersection(y_pred))
@@ -34,7 +39,7 @@ def openea_eval(maxAssignment, y_gold, save_path=None):
     print(f'F1: {f1:.4f}')
     if save_path is not None:
         with open(save_path, 'w') as f:
-            for e1, e2 in y_pred:
+            for e1, e2 in sorted(y_pred):
                 f.write(f'{e1}\t{e2}\t{maxAssignment[e1][e2]}\n')
         print(f'\nSaved final results to "{save_path}"')
 
@@ -80,31 +85,32 @@ def load_ent_results(file_path, prefix, threshold=0.0):
 
 def bilateral_max_assign(sameASscore):
     match_e1_to_e2, match_e2_to_e1 = {}, {}
-    for e1, matches in sameASscore.items():
+    for e1 in sorted(sameASscore):
+        matches = sameASscore[e1]
         if matches:
             max_score = max(matches.values())
-            for e2 in matches:
-                if matches[e2] == max_score:
+            for e2, score in ranked_candidates(matches):
+                if score == max_score:
                     if e1 not in match_e1_to_e2:
                         match_e1_to_e2[e1] = {}
-                    match_e1_to_e2[e1][e2] = matches[e2]
+                    match_e1_to_e2[e1][e2] = score
                     if e2 not in match_e2_to_e1:
                         match_e2_to_e1[e2] = {}
-                        match_e2_to_e1[e2][e1] = matches[e2]
+                        match_e2_to_e1[e2][e1] = score
                         continue
 
                     max_score_e2 = max(match_e2_to_e1[e2].values())
-                    if matches[e2] > max_score_e2:
-                        match_e2_to_e1[e2] = {e1: matches[e2]}
-                    elif max_score_e2 == matches[e2]:
-                        match_e2_to_e1[e2][e1] = matches[e2]
+                    if score > max_score_e2:
+                        match_e2_to_e1[e2] = {e1: score}
+                    elif max_score_e2 == score:
+                        match_e2_to_e1[e2][e1] = score
     res_max_assign = {} # bilateral max assignment
-    for e2 in match_e2_to_e1:
+    for e2 in sorted(match_e2_to_e1):
         # exact match case, avoid duplicates
         if e2 in match_e2_to_e1[e2]:
             res_max_assign[e2] = {e2: match_e2_to_e1[e2][e2]}
             continue
-        for e1 in match_e2_to_e1[e2]:
+        for e1, _score in ranked_candidates(match_e2_to_e1[e2]):
             if e1 in match_e1_to_e2 and e2 in match_e1_to_e2.get(e1, {}):
                 if e2 not in res_max_assign:
                     res_max_assign[e2] = {}
@@ -481,6 +487,3 @@ def oaei_kg_eval(cls_gt, inst_gt, rel_gt,
                 for k, (pred, score) in results.items():
                     f.write(f'{k}\t{pred}\t{score}\n')
         print(f'\nSaved final results to "{save_path}"')
-
-
-

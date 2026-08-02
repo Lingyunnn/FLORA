@@ -1,0 +1,488 @@
+"""
+FLORA cache and checkpoint management utilities.
+
+Caches can speed up repeated runs by storing expensive intermediate results, including
+parsed knowledge graphs, compact graph representations, predicate functionalities, and 
+literal matching scores. 
+
+Checkpoints make long iterative FLORA runs resumable. A checkpoint records the current 
+iteration state, so a later run can continue from the latest compatible saved state.
+"""
+
+import hashlib
+import gc
+import logging
+import multiprocessing as mp
+import os
+import pickle
+import time
+
+import align
+import init
+import sides
+import utils
+
+
+def sorted_existing_paths(paths):
+    return sorted(os.path.abspath(path) for path in paths if path and os.path.exists(path))
+
+
+def file_signature(paths):
+    """Create a file signature from paths, sizes, and modification times."""
+    signature = []
+    for path in sorted_existing_paths(paths):
+        stat = os.stat(path)
+        signature.append((path, stat.st_size, stat.st_mtime_ns))
+    return tuple(signature)
+
+
+def dataset_cache_info(params, dataset_path):
+    """Determine cache key and paths for a given dataset and loading options."""
+    use_compact_kg = params.get('compact_kg', False)
+    if params['dataset'] is not None:
+        dataset_name = params['dataset'].rstrip('/')
+        if 'OpenEA' in params['dataset']:
+            source_files = [
+                os.path.join(dataset_path, 'rel_triples_1'),
+                os.path.join(dataset_path, 'rel_triples_2'),
+                os.path.join(dataset_path, 'attr_triples_1'),
+                os.path.join(dataset_path, 'attr_triples_2'),
+                os.path.join(dataset_path, 'ent_links'),
+            ]
+            options = {'loader': 'openea', 'attr': True}
+        elif 'DBP15k' in params['dataset']:
+            source_files = [
+                os.path.join(dataset_path, 'rel_ids_1'),
+                os.path.join(dataset_path, 'rel_ids_2'),
+                os.path.join(dataset_path, 'ent_ids_1'),
+                os.path.join(dataset_path, 'ent_ids_2'),
+                os.path.join(dataset_path, 'triples_1'),
+                os.path.join(dataset_path, 'triples_2'),
+                os.path.join(dataset_path, 'att_triples_1'),
+                os.path.join(dataset_path, 'att_triples_2'),
+            ]
+            options = {'loader': 'dbp15k', 'attr': True, 'name': True}
+        elif 'OAEI' in params['dataset']:
+            source_files = [
+                os.path.join(dataset_path, 'source.ttl'),
+                os.path.join(dataset_path, 'target.ttl'),
+            ]
+            options = {'loader': 'oaei', 'format': 'ttl'}
+        elif 'small-test' in params['dataset']:
+            base_name = dataset_path.split('/')[-2]
+            source_files = [
+                os.path.join(dataset_path, base_name + '1.ttl'),
+                os.path.join(dataset_path, base_name + '2.ttl'),
+            ]
+            options = {'loader': 'small-test'}
+        else:
+            raise ValueError("Unknown dataset %s" % params['dataset'])
+    else:
+        source_files = [params['kg1'], params['kg2']]
+        dataset_name = 'custom'
+        options = {'loader': 'custom'}
+
+    if use_compact_kg:
+        options = dict(options)
+        options['compact_kg'] = True
+        options['compact_version'] = utils.CompactGraph._VERSION
+
+    signature = file_signature(source_files)
+    cache_key_input = repr((dataset_name, options, signature)).encode('utf-8')
+    cache_key = hashlib.sha256(cache_key_input).hexdigest()[:16]
+    cache_dir = os.path.abspath(os.path.join(os.getcwd(), '../save/cache/kb'))
+    cache_path = os.path.join(cache_dir, f'{cache_key}.pkl')
+    compact_mmap_dir = os.path.abspath(os.path.join(os.getcwd(), '../save/cache/compact_kg', cache_key))
+    return {
+        'dataset_name': dataset_name,
+        'options': options,
+        'source_files': source_files,
+        'signature': signature,
+        'cache_key': cache_key,
+        'cache_dir': cache_dir,
+        'cache_path': cache_path,
+        'compact_mmap_dir': compact_mmap_dir,
+    }
+
+
+def cache_path(cache_group, cache_key):
+    """Return the path to a cache file for a given group and key."""
+    cache_dir = os.path.abspath(os.path.join(os.getcwd(), '../save/cache', cache_group))
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f'{cache_key}.pkl')
+
+
+def load_pickle_cache(path, expected_signature):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as cache_file:
+            payload = pickle.load(cache_file)
+        if payload.get('signature') == expected_signature:
+            logging.info("Loaded cache from %s", path)
+            return payload.get('data')
+        logging.info("Cache signature changed, rebuilding cache: %s", path)
+    except Exception as exc:
+        logging.warning("Failed to load cache %s: %s", path, exc)
+    return None
+
+
+def save_pickle_cache(path, signature, data):
+    try:
+        with open(path, 'wb') as cache_file:
+            pickle.dump(
+                {'signature': signature, 'data': data},
+                cache_file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        logging.info("Saved cache to %s", path)
+    except Exception as exc:
+        logging.warning("Failed to save cache %s: %s", path, exc)
+
+
+def embedding_signature(emb_path):
+    return file_signature([os.path.join(emb_path, 'kb1.pkl'), os.path.join(emb_path, 'kb2.pkl')])
+
+
+def compact_knowledge_bases_if_requested(params, cache_info, kb1, kb2):
+    """Convert parsed KGs to CompactGraph before saving/loading run caches."""
+    if not params.get('compact_kg', False):
+        return kb1, kb2
+    mmap_dir = cache_info['compact_mmap_dir']
+    logging.info("Building compact mmap KG arrays under %s", mmap_dir)
+    compact_start = time.time()
+    kb1 = utils.CompactGraph.from_graph(kb1, mmap_dir, 'kb1')
+    gc.collect()
+    kb2 = utils.CompactGraph.from_graph(kb2, mmap_dir, 'kb2')
+    gc.collect()
+    logging.info("Built compact mmap KG arrays in %s minutes", round((time.time() - compact_start) / 60, 5))
+    return kb1, kb2
+
+
+def load_or_compute_functionalities(graph, source_signature, graph_tag, gram, use_cache=True):
+    """Load cached predicate functionalities, computing them in a child process on miss."""
+    use_ids = hasattr(graph, 'iterFactIds') and hasattr(graph, 'num_entities')
+    graph_side = sides.graph_predicate_side(graph, sides.PRED1 if graph_tag == 'kb1' else sides.PRED2)
+    cache_signature = (
+        source_signature,
+        tuple(gram),
+        'local_id' if use_ids else 'string_keyed',
+        graph_side if use_ids else None,
+    )
+    if use_cache:
+        cache_key = hashlib.sha256(repr((graph_tag, cache_signature)).encode('utf-8')).hexdigest()[:16]
+        path = cache_path('functionalities', cache_key)
+        cached_value = load_pickle_cache(path, cache_signature)
+        if cached_value is not None:
+            return cached_value
+    else:
+        logging.info("Functionalities cache disabled for %s; recomputing", graph_tag)
+        if use_ids:
+            return align.computeFunctionalitiesIds(graph, gram=gram)
+        return align.computeFunctionalities(graph, gram=gram)
+
+    # Compute in a worker so large temporary objects are released on exit.
+    status_queue = mp.Queue(maxsize=1)
+    worker = mp.Process(target=_compute_functionalities_cache_worker, args=(graph, gram, use_ids, path, cache_signature, status_queue))
+    worker.start()
+    worker.join()
+    try:
+        success, error = status_queue.get_nowait()
+    except Exception:
+        success, error = False, "no status returned"
+    finally:
+        status_queue.close()
+        status_queue.join_thread()
+    if worker.exitcode != 0 or not success:
+        raise RuntimeError(
+            "Functionality computation failed for %s: exitcode=%s error=%s"
+            % (graph_tag, worker.exitcode, error)
+        )
+    cached_value = load_pickle_cache(path, cache_signature)
+    if cached_value is None:
+        raise RuntimeError("Functionality computation did not create a readable cache: %s" % path)
+    return cached_value
+
+
+def _compute_functionalities_cache_worker(graph, gram, use_ids, path, cache_signature, status_queue):
+    try:
+        if use_ids:
+            computed_value = align.computeFunctionalitiesIds(graph, gram=gram)
+        else:
+            computed_value = align.computeFunctionalities(graph, gram=gram)
+        save_pickle_cache(path, cache_signature, computed_value)
+        status_queue.put((True, None))
+    except BaseException as exc:
+        logging.exception("Failed to compute functionalities in worker")
+        status_queue.put((False, repr(exc)))
+
+
+def load_or_compute_literal_scores(kb1, kb2, emb_path, params, source_signature, use_cache=True):
+    """Load cached literal matching scores, computing and side-keying them on miss."""
+    use_id_keyed_scores = sides.can_use_id_keyed_state(kb1, kb2)
+    cache_signature = (
+        source_signature,
+        None if params['string_identity'] else embedding_signature(emb_path),
+        params['string_identity'],
+        params['init'],
+        params.get('literal_english_filter', False),
+        params.get('literal_idf', False),
+        params.get('literal_faiss_index', 'flat'),
+        params.get('literal_hnsw_m', 32),
+        params.get('literal_hnsw_ef_search', 64),
+        params.get('literal_hnsw_ef_construction', 200),
+        'id_keyed' if use_id_keyed_scores else 'string_keyed',
+    )
+    if use_cache:
+        cache_key = hashlib.sha256(repr(('literal_matching', cache_signature)).encode('utf-8')).hexdigest()[:16]
+        path = cache_path('literal_matching', cache_key)
+        cached_value = load_pickle_cache(path, cache_signature)
+        if cached_value is not None:
+            return cached_value
+    else:
+        logging.info("Literal matching cache disabled; recomputing")
+
+    literal_scores = {}
+    init.mapLiterals(
+        kb1,
+        kb2,
+        emb_path,
+        literal_scores,
+        literal_identity_only=params['string_identity'],
+        threshold=params['init'],
+        literal_english_filter=params.get('literal_english_filter', False),
+        literal_idf=params.get('literal_idf', False),
+        literal_faiss_index=params.get('literal_faiss_index', 'flat'),
+        literal_hnsw_m=params.get('literal_hnsw_m', 32),
+        literal_hnsw_ef_search=params.get('literal_hnsw_ef_search', 64),
+        literal_hnsw_ef_construction=params.get('literal_hnsw_ef_construction', 200),
+    )
+    if use_id_keyed_scores:
+        literal_scores = sides.maybe_encode_same_as_scores(literal_scores, kb1, kb2)
+    if use_cache:
+        save_pickle_cache(path, cache_signature, literal_scores)
+    return literal_scores
+
+
+def _load_knowledge_bases_cache(path, signature):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as cache_file:
+            cached_payload = pickle.load(cache_file)
+        if cached_payload.get('signature') == signature:
+            logging.info("Loaded KG cache from %s", path)
+            return cached_payload['kb1'], cached_payload['kb2'], cached_payload.get('gt_pairs')
+        logging.info("KG cache signature changed, rebuilding cache: %s", path)
+    except Exception as exc:
+        logging.warning("Failed to load KG cache %s: %s", path, exc)
+    return None
+
+
+def _save_knowledge_bases_cache(path, cache_info, kb1, kb2, gt_pairs):
+    os.makedirs(cache_info['cache_dir'], exist_ok=True)
+    try:
+        with open(path, 'wb') as cache_file:
+            pickle.dump(
+                {
+                    'signature': cache_info['signature'],
+                    'kb1': kb1,
+                    'kb2': kb2,
+                    'gt_pairs': gt_pairs,
+                },
+                cache_file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        logging.info("Saved KG cache to %s", path)
+        return True
+    except Exception as exc:
+        logging.warning("Failed to save KG cache %s: %s", path, exc)
+        return False
+
+
+def load_knowledge_bases_with_cache(params, dataset_path):
+    """Load parsed KGs from cache, or parse/compact/save them on cache miss."""
+    cache_info = dataset_cache_info(params, dataset_path)
+    path = cache_info['cache_path']
+
+    cached_value = _load_knowledge_bases_cache(path, cache_info['signature'])
+    if cached_value is not None:
+        return cached_value
+
+    if params.get('compact_kg', False):
+        # Build compact KG cache in a worker to free peak conversion memory.
+        status_queue = mp.Queue(maxsize=1)
+        worker = mp.Process(
+            target=_build_compact_knowledge_bases_cache_worker,
+            args=(params, dataset_path, cache_info, path, status_queue),
+        )
+        worker.start()
+        worker.join()
+        try:
+            success, error = status_queue.get_nowait()
+        except Exception:
+            success, error = False, "no status returned"
+        finally:
+            status_queue.close()
+            status_queue.join_thread()
+        if worker.exitcode != 0 or not success:
+            raise RuntimeError(
+                "Compact KG cache build failed: exitcode=%s error=%s"
+                % (worker.exitcode, error)
+            )
+
+        cached_value = _load_knowledge_bases_cache(path, cache_info['signature'])
+        if cached_value is None:
+            raise RuntimeError("Compact KG cache build did not create a readable cache: %s" % path)
+        return cached_value
+
+    kb1, kb2, gt_pairs = load_raw_knowledge_bases(params, dataset_path)
+
+    kb1, kb2 = compact_knowledge_bases_if_requested(params, cache_info, kb1, kb2)
+
+    _save_knowledge_bases_cache(path, cache_info, kb1, kb2, gt_pairs)
+    return kb1, kb2, gt_pairs
+
+
+def _build_compact_knowledge_bases_cache_worker(params, dataset_path, cache_info, path, status_queue):
+    try:
+        kb1, kb2, gt_pairs = load_raw_knowledge_bases(params, dataset_path)
+        kb1, kb2 = compact_knowledge_bases_if_requested(params, cache_info, kb1, kb2)
+        if not _save_knowledge_bases_cache(path, cache_info, kb1, kb2, gt_pairs):
+            raise RuntimeError("failed to save KG cache")
+        status_queue.put((True, None))
+    except BaseException as exc:
+        logging.exception("Failed to build compact KG cache in worker")
+        status_queue.put((False, repr(exc)))
+
+
+def load_raw_knowledge_bases(params, dataset_path):
+    """Parse KGs from source files without reading or writing the KG pickle cache."""
+    gt_pairs = None
+    if params['dataset'] is not None:
+        if 'OpenEA' in params['dataset']:
+            kb1, kb2, gt_pairs = utils.load_openea(dataset_path, attr=True)
+        elif 'DBP15k' in params['dataset']:
+            kb1, kb2 = utils.load_dbp15k(dataset_path, attr=True, name=True)
+        elif 'OAEI' in params['dataset']:
+            kb1, kb2 = utils.load_oaei(dataset_path, format='ttl')
+        elif 'small-test' in params['dataset']:
+            base_name = dataset_path.split('/')[-2]
+            kb1 = utils.graphFromTurtleFile(os.path.join(dataset_path, base_name + '1.ttl'))
+            kb2 = utils.graphFromTurtleFile(os.path.join(dataset_path, base_name + '2.ttl'))
+        else:
+            raise ValueError("Unknown dataset %s" % params['dataset'])
+    else:
+        kb1 = utils.graphFromTurtleFile(params['kg1'])
+        kb2 = utils.graphFromTurtleFile(params['kg2'])
+    return kb1, kb2, gt_pairs
+
+
+def load_knowledge_bases(params, dataset_path, use_cache=True):
+    """Load KGs through the configured cache policy, applying compact conversion."""
+    if use_cache:
+        return load_knowledge_bases_with_cache(params, dataset_path)
+    logging.info("KG cache disabled; parsing raw source files")
+    cache_info = dataset_cache_info(params, dataset_path)
+    kb1, kb2, gt_pairs = load_raw_knowledge_bases(params, dataset_path)
+    kb1, kb2 = compact_knowledge_bases_if_requested(params, cache_info, kb1, kb2)
+    return kb1, kb2, gt_pairs
+
+
+def checkpoint_signature(params, kg_cache_info):
+    """Return the run identity used to decide whether a checkpoint is compatible."""
+    relevant_params = {
+        key: params.get(key)
+        for key in (
+            'dataset',
+            'kg1',
+            'kg2',
+            'trainingdata',
+            'embedding',
+            'literal_scores',
+            'alpha',
+            'init',
+            'string_identity',
+            'gramN',
+            'evidence_upper_bound',
+            'compact_kg',
+            'literal_idf',
+            'literal_embedding_model',
+        )
+    }
+    if params.get('literal_english_filter', False):
+        relevant_params['literal_english_filter'] = True
+    return {
+        'dataset_signature': kg_cache_info['signature'],
+        'kg_cache_key': kg_cache_info['cache_key'],
+        'params': relevant_params,
+    }
+
+
+def default_checkpoint_dir(output_path):
+    output_stem = os.path.splitext(os.path.basename(output_path))[0]
+    return os.path.abspath(os.path.join(os.getcwd(), '../save/checkpoints', output_stem))
+
+
+def checkpoint_path(checkpoint_dir, iterations):
+    return os.path.join(checkpoint_dir, f'checkpoint_iter_{iterations:04d}.pkl')
+
+
+def latest_checkpoint_path(checkpoint_dir):
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return None
+    candidates = [
+        os.path.join(checkpoint_dir, filename)
+        for filename in os.listdir(checkpoint_dir)
+        if filename.startswith('checkpoint_iter_') and filename.endswith('.pkl')
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def save_checkpoint(checkpoint_dir, signature, iterations, sameAsScores, predicate2superPredicate, quasiEqvirel):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = checkpoint_path(checkpoint_dir, iterations)
+    tmp_path = path + '.tmp'
+    payload = {
+        'version': 1,
+        'signature': signature,
+        'iterations': iterations,
+        'sameAsScores': sameAsScores,
+        'predicate2superPredicate': predicate2superPredicate,
+        'quasiEqvirel': quasiEqvirel,
+        'saved_at': time.time(),
+    }
+    try:
+        with open(tmp_path, 'wb') as checkpoint_file:
+            pickle.dump(payload, checkpoint_file, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, path)
+        logging.info("Saved checkpoint iteration=%s path=%s", iterations, path)
+    except Exception as exc:
+        logging.warning("Failed to save checkpoint %s: %s", path, exc)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def load_latest_checkpoint(checkpoint_dir, signature):
+    path = latest_checkpoint_path(checkpoint_dir)
+    if path is None:
+        logging.info("No checkpoint found in %s", checkpoint_dir)
+        return None
+    try:
+        with open(path, 'rb') as checkpoint_file:
+            payload = pickle.load(checkpoint_file)
+    except Exception as exc:
+        logging.warning("Failed to load checkpoint %s: %s", path, exc)
+        return None
+    if payload.get('signature') != signature:
+        logging.warning(
+            "Latest checkpoint signature does not match this run; ignoring path=%s", path)
+        return None
+    logging.info(
+        "Loaded checkpoint iteration=%s path=%s", payload.get('iterations'), path)
+    return payload
