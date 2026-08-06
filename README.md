@@ -2,7 +2,7 @@
 
 _This repository contains a Python implementation of [FLORA: Unsupervised Knowledge Graph Alignment by Fuzzy Logic](https://suchanek.name/work/publications/iswc-2025.pdf), best paper award at ISWC 2025._
 
-<!-- ![FLORA pipeline](docs/pipeline.png) -->
+![FLORA pipeline](docs/pipeline.png)
 FLORA is an unsupervised system for automatic knowledge graph (KG) alignment, jointly matching entities and relations in one KG to their equivalents in another.
 
 ## This Version
@@ -193,7 +193,7 @@ Alignment outputs are written to the path given with `--output`, commonly under 
 This codebase is adapted from the [original FLORA implementation](https://github.com/dig-team/FLORA) by Yiwen Peng, Thomas Bonald, and Fabian Suchanek. 
 The code is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0). 
 
-<!-- ## Citation
+## Citation
 
 If you use this project for academic purposes, please cite the FLORA paper:
 
@@ -203,5 +203,5 @@ If you use this project for academic purposes, please cite the FLORA paper:
     author = "Peng, Yiwen and Bonald, Thomas and Suchanek, Fabian",
     booktitle = "International Semantic Web Conference (ISWC)",
     year = 2025
-} -->
+}
 ```
