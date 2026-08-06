@@ -1,192 +1,22 @@
 """
-FLORA literal matching initialization utilities.
-
-This module can be run independently from FLORA's main loop. 
-The main loop of FLORA can run on CPU, while literal matching benefits from 
-GPU acceleration when FAISS GPU support is available. Keeping this file executable
-therefore makes it convenient to precompute literal matching scores separately
-on a GPU machine, save them, and reuse them later in the CPU-only FLORA loop.
+This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+Description: Literal matching and literal-score initialization utilities, including exact and embedding-based matching.
+This module can be run independently from FLORA's main loop. Because faiss-based literal matching benefits from GPU acceleration, 
+literal matching results can be precomputed on a GPU-enabled machine, saved to disk, and later reused by CPU-only FLORA runs.
 """
 
-import re
 import os
 import math
 import time
 import logging
 import argparse
-import unicodedata
 from collections import defaultdict
 import pickle
 import numpy as np
-from urllib.parse import unquote
 import faiss
-
-
-#################################################################
-#            Literal parsing and datatype helpers               #
-#################################################################
-
-# Regex for literals
-literalRegex=re.compile('"([^"]*)"(@([a-z-]+))?(\\^\\^(.*))?')
-
-# Regex for int values
-intRegex=re.compile('^"?[+-]?[0-9]+"?$')
-
-# Regex for float values
-floatRegex = re.compile('^"?([+-])?([0-9.]+)"?$')
-sciFloatRegex = re.compile('^"?([+-])?([0-9.]+[Ee][+-]?[0-9]+)"?$')
-
-# Regex for numbers: post code, phone number, etc.
-# A normalized-number candidate must contain at least one digit.
-numberRegex = re.compile(r'(?=.*\d)[\d\W]+')
-identifierRegex = re.compile(r'([a-zA-Z]+)(\d+)') # TBD if needed
-
-DATE_DATATYPES = {'xsd:date', 'xsd:gYear', 'xsd:gYearMonth', 'xsd:dateTime', 'xsd:gMonthDay'}
-
-
-def isLiteral(term):
-    return re.match(literalRegex,term) or re.match(floatRegex,term)
-
-def normalize_datatype(datatype):
-    """Normalize the datatype to a standard format. e.g., "http://www.w3.org/2001/XMLSchema#string" -> "xsd:string"."""
-    if datatype is None:
-        return None
-    datatype = datatype.strip()
-    if datatype.startswith('<') and datatype.endswith('>'):
-        datatype = datatype[1:-1]
-    xmlschema_prefix = 'http://www.w3.org/2001/XMLSchema#'
-    if datatype.startswith(xmlschema_prefix):
-        datatype = 'xsd:' + datatype[len(xmlschema_prefix):]
-    return datatype
-
-def unicode(txt):
-    # e.g., "Coamo,_Puerto_Rico" -> "Coamo_u002C_Puerto_Rico"
-    encoded_str = re.sub(r'[^a-zA-Z0-9_]', lambda x: "_u{:04X}_".format(ord(x.group())), txt)
-    return encoded_str
-
-def decode_unicode(encoded_str):
-    decoded_string = re.sub(r'_u([0-9A-F]{4})_', lambda x: chr(int(x.group(1), 16)), encoded_str)
-    if '\\u' in decoded_string:
-        try:
-            s = decoded_string.encode('utf-8').decode('unicode_escape')
-            return s.encode('utf-16', 'surrogatepass').decode('utf-16')
-        except Exception:
-            return decoded_string
-    else:
-        return decoded_string
-
-def numeric_normalization(term):
-    term = term.strip('"')
-    # Normalize the input string by removing all non-digit characters, except the sign
-    # sign = term[0] if term.startswith('-') or term.startswith('+') else None
-    normalized = re.sub(r'[^0-9]', '', term)
-    return normalized
-
-def splitLiteral(term):
-    """ Returns String value, int value, language, and datatype of a term (or None, None, None, None). No good backslash handling """
-
-    literal, _, lang, _, datatype = re.match(literalRegex, term).groups()
-    datatype = normalize_datatype(datatype)
-    # Dates
-    if datatype in DATE_DATATYPES:
-        return (literal, None, lang, datatype)
-    
-    # Numbers
-    floatmatch = re.match(floatRegex, literal)
-    scifloatmatch = re.match(sciFloatRegex, literal)
-    if (floatmatch or scifloatmatch) and lang is None:
-        try:
-            # some identifiers are integers
-            Value=int(literal.strip('"'))
-            if len(str(Value)) != len(literal.strip('"')):
-                # e.g., "06" /= 6, "+3" /= 3
-                return (literal, None, lang, datatype) # datatype 'none'
-            return (literal, Value, lang, datatype)
-        except:
-            try:
-                # e.g., code version 1.0 /= 1
-                Value=float(literal.strip('"'))
-                return (literal, Value, lang, datatype)
-            except ValueError:
-                # e.g. "23.78.9" version
-                return (literal, None, lang, datatype)
-    
-    matchNumber=re.fullmatch(numberRegex, literal)
-    # Check if the string is a number type, e.g., "818/762-1221"
-    if matchNumber:
-        Value = numeric_normalization(literal)
-        if len(Value) > 0:
-            return (literal, 'normalized_'+Value, lang, datatype)
-    # Strings: lowecasing, order-agnostic, decode unicode
-    # Pre-processing for string literals
-    de_literal = decode_unicode(literal)
-    return (de_literal, None, lang, 'xsd:string')
-
-
-#################################################################
-#          Literal normalization and candidate filters          #
-#################################################################
-
-def reorder_string_with_brackets(input):
-    bracket_content = re.findall(r'\(.*?\)', input)
-    content_without_brackets = re.sub(r'\(.*?\)', '', input).split()
-    return (' '.join(set(content_without_brackets)) + ' ' + ' '.join(bracket_content)).strip()
-
-def is_punctuation_only_literal(txt):
-    """Check if a string literal consists only of punctuation characters."""
-    txt = decode_unicode(txt).strip()
-    return bool(txt) and not any(char.isalnum() for char in txt)
-
-def is_human_readable(txt):
-    if not txt or len(txt) == 0:
-        return False
-    # not a web link
-    if txt.startswith('http'):
-        return False
-    non_alpha_ratio = sum(not c.isalpha() for c in txt) / len(txt) 
-    return non_alpha_ratio < 0.5
-
-def is_faiss_literal_candidate(txt):
-    """Filter string literals before FAISS search."""
-    if not txt:
-        return False
-    txt = decode_unicode(txt).strip()
-    if not txt:
-        return False
-    return is_human_readable(txt)
-
-def normalize_string_literal(value):
-    value = decode_unicode(value) # decode unicode characters
-    value = unquote(value) # decode URL-encoded characters
-    value = value.strip() # remove spaces
-    value = value.lower() # convert to lowercase
-
-    # Normalize common separators.
-    value = value.replace('_', ' ') # replace underscores with spaces
-    value = re.sub(r'\s+', ' ', value) # replace multiple spaces with a single space
-    return value.strip()
-
-def is_latin_alpha(char):
-    if not char.isalpha():
-        return False
-    try:
-        return 'LATIN' in unicodedata.name(char)
-    except ValueError:
-        return False
-
-def is_english_string_literal(literal, lang=None, min_latin_ratio=0.8):
-    """Check if a string literal is likely to be English based on its language tag and the ratio of Latin letters."""
-    if lang is not None:
-        lang = lang.lower()
-        if lang != 'en' and not lang.startswith('en-'):
-            return False
-
-    letters = [char for char in decode_unicode(literal) if char.isalpha()]
-    if not letters:
-        return True
-
-    latin_letters = sum(1 for char in letters if is_latin_alpha(char))
-    return latin_letters / len(letters) >= min_latin_ratio
+import Announce
+import literal_base
 
 
 #################################################################
@@ -270,7 +100,7 @@ def _iter_literal_facts(kb):
         return
 
     for subject, predicate, obj in kb:
-        if isLiteral(obj):
+        if literal_base.isLiteral(obj):
             yield subject, predicate, obj
 
 
@@ -322,17 +152,14 @@ def getLiteralBuckets(kb, literal_english_filter=False):
     digitBucket = defaultdict(list) # e.g., IDs, code versions, identifier
     strBucket = defaultdict(list) # e.g., strings
     dateBucket = defaultdict(list) # e.g., dates
-    if hasattr(kb, 'iter_literal_object_ids') and hasattr(kb, 'entity_for_id'): # for compact graph
-        literal_objects = (kb.entity_for_id(object_id) for object_id in kb.iter_literal_object_ids())
-    else:
-        literal_objects = (object1 for object1 in kb.objects() if isLiteral(object1))
+    literal_objects = literal_base.iter_literal_objects(kb)
 
     for object1 in literal_objects:
-        literal, numValue, lang, datatype = splitLiteral(object1)
-        if is_punctuation_only_literal(literal):
+        literal, numValue, lang, datatype = literal_base.splitLiteral(object1)
+        if literal_base.is_punctuation_only_literal(literal):
             continue
         # dates handling
-        if datatype in DATE_DATATYPES:
+        if datatype in literal_base.DATE_DATATYPES:
             dateBucket[literal].append(object1)
             continue
         # numeric handling
@@ -351,18 +178,44 @@ def getLiteralBuckets(kb, literal_english_filter=False):
                 strBucket[numValue].append(object1)
             continue
         # string handling
-        if literal_english_filter and not is_english_string_literal(literal, lang):
+        if literal_english_filter and not literal_base.is_english_string_literal(literal, lang):
             continue
         # if is_human_readable(literal):
         strBucket[literal].append(object1)
-        normalized_literal = normalize_string_literal(literal)
+        normalized_literal = literal_base.normalize_string_literal(literal)
         if normalized_literal != literal:
             strBucket[normalized_literal].append(object1)
             
     return quantityBucket, digitBucket, strBucket, dateBucket
 
-# Compare literals in same type buckets
 def compareLiterals(sameAsScores, bucket1, bucket2, datatype=None, weights1=None, weights2=None, min_score=None):
+    """
+    Compare two literal buckets and add sameAs scores for compatible literal values.
+
+    The buckets are produced by getLiteralBuckets(), so each key represents a
+    normalized literal value and each value is the list of original literal terms
+    that produced it. Numeric buckets use approximate numeric equality, date
+    buckets allow prefix matches such as year-month against year-month-day, and
+    digit/string-like buckets require exact normalized-key equality.
+
+    Parameters
+    ----------
+    sameAsScores : dict
+        Nested dictionary updated in place with literal-to-literal scores.
+    bucket1 : dict
+        Source-side normalized literal bucket.
+    bucket2 : dict
+        Target-side normalized literal bucket.
+    datatype : str
+        Bucket type to compare. Supported values are 'quantity', 'date', and
+        digit/string-like fallback values.
+    weights1 : dict, optional
+        Source-side literal IDF weights.
+    weights2 : dict, optional
+        Target-side literal IDF weights.
+    min_score : float, optional
+        Drop weighted scores below this threshold.
+    """
     if datatype is None:
         raise ValueError('Datatype must be specified')
     # strings, dates
@@ -454,6 +307,46 @@ def mapLiterals(
     literal_hnsw_ef_search=64,
     literal_hnsw_ef_construction=200,
 ):
+    """
+    Compute literal-based initialization scores between two knowledge bases.
+
+    This is the main literal matching pipeline. It groups literal objects by
+    datatype/normalized value, adds exact numeric/date/string matches, optionally
+    applies subject-level IDF weighting, and then uses FAISS over precomputed
+    literal embeddings to find approximate string matches. The resulting literal
+    matches are merged into sameAsScore in place.
+
+    Parameters
+    ----------
+    kb1 : Graph-like
+        Source knowledge base, CompactGraph, or LiteralOnlyGraph adapter.
+    kb2 : Graph-like
+        Target knowledge base, CompactGraph, or LiteralOnlyGraph adapter.
+    path_emb : str
+        Directory containing kb1.pkl and kb2.pkl literal embedding files.
+    sameAsScore : dict
+        Nested dictionary updated in place with literal sameAs scores.
+    literal_identity_only : bool, optional
+        If true, use exact literal identity only and skip embedding search.
+    threshold : float, optional
+        Minimum embedding similarity score for unweighted FAISS matches.
+    chunk_size : int, optional
+        Number of source literal embeddings queried per FAISS batch.
+    top_k : int, optional
+        Number of target literals retrieved for each source literal.
+    literal_english_filter : bool, optional
+        Keep only likely English string literals before string matching.
+    literal_idf : bool, optional
+        Reweight scores using subject-level literal IDF.
+    literal_faiss_index : str, optional
+        FAISS index type, either 'flat' for exact search or 'hnsw' for approximate CPU search.
+    literal_hnsw_m : int, optional
+        HNSW graph degree when literal_faiss_index is 'hnsw'.
+    literal_hnsw_ef_search : int, optional
+        HNSW efSearch value when literal_faiss_index is 'hnsw'.
+    literal_hnsw_ef_construction : int, optional
+        HNSW efConstruction value when literal_faiss_index is 'hnsw'.
+    """
     total_start = time.time()
     mapScores = {}
     logging.info(
@@ -464,6 +357,7 @@ def mapLiterals(
         literal_english_filter, literal_faiss_index, literal_hnsw_m, literal_hnsw_ef_search,
         literal_hnsw_ef_construction, path_emb,
     )
+    # Build literal buckets
     stage_start = time.time()
     quantityBucket1, digitBucket1, strBucket1, dateBucket1 = getLiteralBuckets(kb1, literal_english_filter=literal_english_filter)
     quantityBucket2, digitBucket2, strBucket2, dateBucket2 = getLiteralBuckets(kb2, literal_english_filter=literal_english_filter)
@@ -475,6 +369,7 @@ def mapLiterals(
         *_bucket_stats(quantityBucket1), *_bucket_stats(digitBucket1), *_bucket_stats(strBucket1), *_bucket_stats(dateBucket1),
         *_bucket_stats(quantityBucket2), *_bucket_stats(digitBucket2), *_bucket_stats(strBucket2), *_bucket_stats(dateBucket2),
     )
+    # Compute literal IDF weights if requested
     weights1 = weights2 = None
     if literal_idf:
         stage_start = time.time()
@@ -486,6 +381,9 @@ def mapLiterals(
 )
     weighted_min_score = threshold if literal_idf else None
     if not literal_identity_only:
+        # Exact matches are handled first, 
+        # so that FAISS search can skip source literals that already have a perfect match.
+
         # Dates
         stage_start = time.time()
         compareLiterals(mapScores, dateBucket1, dateBucket2, 'date', weights1, weights2, weighted_min_score)
@@ -496,7 +394,6 @@ def mapLiterals(
             "Literal date/number matching done | elapsed_min=%.3f | sources=%s | pairs=%s",
             (time.time() - stage_start) / 60, len(mapScores), sum(len(values) for values in mapScores.values()),
         )
-
         # Compare strings
         stage_start = time.time()
         compareLiterals_identity(mapScores, strBucket1, strBucket2, weights1, weights2, weighted_min_score) # first get exact match
@@ -504,6 +401,8 @@ def mapLiterals(
             "Literal exact string matching done | elapsed_min=%.3f | sources=%s | pairs=%s",
             (time.time() - stage_start) / 60, len(mapScores), sum(len(values) for values in mapScores.values()),
         )
+
+        # Embedding-based string matching using FAISS
 
         emb1_path = os.path.join(path_emb, 'kb1.pkl')
         emb2_path = os.path.join(path_emb, 'kb2.pkl')
@@ -535,7 +434,7 @@ def mapLiterals(
                     continue
 
                 # Keep only human-readable strings.
-                if not is_faiss_literal_candidate(key1):
+                if not literal_base.is_faiss_literal_candidate(key1):
                     continue
 
                 # Must have a precomputed embedding.
@@ -553,7 +452,7 @@ def mapLiterals(
                     continue
 
                 # Keep only human-readable strings.
-                if not is_faiss_literal_candidate(key2):
+                if not literal_base.is_faiss_literal_candidate(key2):
                     continue
 
                 if key2 not in literal2id_kb2:
@@ -670,13 +569,14 @@ def mapLiterals(
 
 
 #################################################################
-#  Streaming TTL loaders for memory-efficient literal matching  #
+#  Literal-only TTL loaders for memory-efficient matching       #
 #################################################################
 
-class StreamingLiteralGraph:
-    """A Graph-like adapter used for memory-efficient literal matching.
-    It keeps only literal objects, and optionally literal -> subjects mappings for IDF calculation,
-    so mapLiterals can run without loading the full RDF graph into memory.
+class LiteralOnlyGraph:
+    """A Graph-like adapter backed by a reduced in-memory literal index.
+
+    It keeps only literal objects, and optionally literal -> subjects mappings for IDF calculation, 
+    so mapLiterals can run without loading the full graph into memory.
     """
 
     def __init__(self, literal_objects, literal_subjects=None):
@@ -713,39 +613,28 @@ class StreamingLiteralGraph:
                 yield subject, None, obj
 
 
-def iter_ttl_literal_facts(path):
-    """Yield (subject, literal_object) from one-triple-per-line TTL files."""
-    with open(path, "rt", encoding="utf-8", errors="replace") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("@prefix") or line.startswith("#"):
-                continue
-            parts = line.split(None, 2)
-            if len(parts) != 3 or not parts[2].endswith("."):
-                continue
-            obj = parts[2][:-1].strip()
-            if obj.startswith('"') and isLiteral(obj):
-                yield parts[0], obj
+def load_literal_only_graph_from_ttl(path, collect_subjects=False, fast_line_parser=True):
+    """Scan a TTL file and return a literal-only in-memory graph adapter.
 
-
-def load_streaming_literal_graph(path, collect_subjects=False):
-    """Load a TTL file and return a StreamingLiteralGraph containing only literal objects."""
+    This avoids materializing the complete RDF graph. It stores unique literal
+    objects, plus literal -> subjects mappings when IDF needs subject counts.
+    """
     literal_objects = set()
     literal_subjects = defaultdict(set) if collect_subjects else None
     literal_fact_count = 0
     start_time = time.time()
 
-    for subject, obj in iter_ttl_literal_facts(path):
+    for subject, obj in literal_base.iter_ttl_literal_facts(path, fast_line_parser=fast_line_parser):
         literal_fact_count += 1
         literal_objects.add(obj)
         if literal_subjects is not None:
             literal_subjects[obj].add(subject)
 
     logging.info(
-        "Streaming literal scan done | file=%s | parsed_literal_facts=%s | unique_literals=%s | elapsed_min=%.3f",
+        "Literal-only TTL scan done | file=%s | parsed_literal_facts=%s | unique_literals=%s | elapsed_min=%.3f",
         path, literal_fact_count, len(literal_objects), (time.time() - start_time) / 60,
     )
-    return StreamingLiteralGraph(literal_objects, literal_subjects)
+    return LiteralOnlyGraph(literal_objects, literal_subjects)
 
 
 #################################################################
@@ -768,6 +657,9 @@ def get_params():
     parser.add_argument("--literal_hnsw_m", type=int, default=32)
     parser.add_argument("--literal_hnsw_ef_search", type=int, default=64)
     parser.add_argument("--literal_hnsw_ef_construction", type=int, default=200)
+    parser.add_argument("--literal_parser", choices=["fast", "turtle"], default="fast",
+        help="TTL literal parser used for streaming extraction: fast one-triple-per-line scanner or FLORA's general Turtle parser.",
+    )
     return parser.parse_args()
 
 def main():
@@ -775,8 +667,15 @@ def main():
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
     sameAsScore = {}
     needs_subjects = args.literal_idf
-    kb1 = load_streaming_literal_graph(args.kg1, collect_subjects=needs_subjects)
-    kb2 = load_streaming_literal_graph(args.kg2, collect_subjects=needs_subjects)
+
+    Announce.doing("Running literal matching precomputation")
+    Announce.doing("Scanning literal facts")
+    fast_line_parser = args.literal_parser == "fast"
+    kb1 = load_literal_only_graph_from_ttl(args.kg1, collect_subjects=needs_subjects, fast_line_parser=fast_line_parser)
+    kb2 = load_literal_only_graph_from_ttl(args.kg2, collect_subjects=needs_subjects, fast_line_parser=fast_line_parser)
+    Announce.done()
+
+    Announce.doing("Computing literal alignment scores")
     mapLiterals(
         kb1,
         kb2,
@@ -793,6 +692,9 @@ def main():
         literal_hnsw_ef_search=args.literal_hnsw_ef_search,
         literal_hnsw_ef_construction=args.literal_hnsw_ef_construction,
     )
+    Announce.done()
+
+    Announce.doing("Saving literal alignment scores")
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "wb") as output_file:
         pickle.dump(sameAsScore, output_file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -800,6 +702,9 @@ def main():
         "Saved literal matching scores | output=%s | sources=%s | pairs=%s",
         args.output, len(sameAsScore), sum(len(values) for values in sameAsScore.values()),
     )
+    Announce.done()
+    Announce.done()
+    Announce.message("Done")
 
 if __name__ == "__main__":
     main()

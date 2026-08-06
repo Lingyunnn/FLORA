@@ -1,3 +1,9 @@
+"""
+This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+Description: Command-line entry point that configures datasets, runs FLORA's alignment loop, and writes results.
+"""
+
 import Prefixes
 import Announce
 import time
@@ -9,10 +15,12 @@ import os
 import sys
 import shutil
 import pickle
-import align
+import alignment_base
+import relation_mapping
+import entity_alignment
 import cache
 import log
-import sides
+import side_keys
 
 
 # hyperparameters
@@ -31,13 +39,13 @@ def get_params():
         There are two different ways of calling FLORA.
 
         1) For Custom KGs, please provide the input KGs explicitly through --kg1, --kg2, for example:
-            python main.py --kg1 ../data/kg1.ttl --kg2 ../data/kg2.ttl --embedding ../data/emb/ --output results.ttl
+            python main.py --kg1 ../data/my_dataset/kg1.ttl --kg2 ../data/my_dataset/kg2.ttl --embedding ../data/emb/my_dataset/ --output ../save/my_dataset.ttl
 
         2) For benchmark datasets, please use --dataset parameter, for example:
-            python main.py --dataset OpenEA/D_W_15K_V2/ --embedding emb/D_W_15K_V2/ --alpha 3.0 --init 0.7 --output dw-v2.ttl
+            python main.py --dataset OpenEA/D_W_15K_V2/ --embedding emb/D_W_15K_V2/ --alpha 3.0 --init 0.7 --output ../save/results/dw-v2.ttl
 
         To quickly test the code, you can use the small-test dataset:
-            python main.py --dataset small-test/mini/ --embedding emb/mini/ --output mini-test.ttl
+            python main.py --dataset small-test/mini/ --embedding emb/mini/ --output ../save/results/mini-test.ttl
         """,
         formatter_class=CustomFormatter
     )
@@ -45,13 +53,21 @@ def get_params():
     # Data source and run artifacts: choose either a benchmark dataset or custom
     # KG files, then configure where auxiliary inputs and final output live.
     io_group = parser.add_argument_group('Input and output')
-    io_group.add_argument('--dataset', type=str, default=None, help='Benchmark dataset under ../data, e.g., OpenEA/D_W_15K_V2/')
+    io_group.add_argument('--dataset', type=str, default=None,
+        help=(
+            'Benchmark dataset under ../data. Examples:\n'
+            '  OpenEA/D_W_15K_V1/, OpenEA/D_W_15K_V2/\n'
+            '  DBP15k/fr_en/, DBP15k/ja_en/, DBP15k/zh_en/\n'
+            '  OAEI/memoryalpha-stexpanded/, OAEI/starwars-swtor/\n'
+            '  small-test/mini/, small-test/person/, small-test/restaurant/'
+        ),
+    )
     io_group.add_argument('--kg1', type=str, default='../data/source.ttl', help='Custom source Turtle file used as KG1')
     io_group.add_argument('--kg2', type=str, default='../data/target.ttl', help='Custom target Turtle file used as KG2')
     io_group.add_argument('--embedding', type=str, default=None, help='Literal embedding folder for the two KGs, e.g., emb/D_W_15K_V2/')
     io_group.add_argument('--literal_scores', type=str, default=None, help='Precomputed literal sameAs score pickle from init.py, e.g., emb/D_W_15K_V2/literal_scores.pkl')
     io_group.add_argument('--trainingdata', type=str, default=None, help='Optional seed alignment file under ../data')
-    io_group.add_argument('--output', type=str, default='results.ttl', help='Output file name under ../save')
+    io_group.add_argument('--output', type=str, default='../save/results/my_dataset.ttl', help='Output file path.')
     # Literal initialization
     literal_group = parser.add_argument_group('Literal initialization')
     literal_group.add_argument('--init', type=float, default=0.7, help='Initial literal similarity threshold')
@@ -100,7 +116,7 @@ def get_params():
 
 
 if __name__ == '__main__':
-    Announce.doing("Running FLORA...")
+    Announce.doing("Running FLORA")
 
     params = get_params()
     Announce.set_logger(params)
@@ -113,7 +129,15 @@ if __name__ == '__main__':
         emb_path = '../data/{a}'.format(a=params['embedding']) if params['embedding'] else '../data/emb/' # default path
     else:
         emb_path = params['embedding'] if params['embedding'] else '../data/emb/' # default path
-    output_path = '../save/{a}'.format(a=params['output'])
+    output_path = (
+        os.path.join('../save/results', params['output'])
+        if not os.path.isabs(params['output']) and not os.path.dirname(params['output'])
+        else params['output']
+    )
+    params['output'] = output_path
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     checkpoint_dir = (
         os.path.abspath(params['checkpoint_dir'])
         if params['checkpoint_dir']
@@ -126,7 +150,7 @@ if __name__ == '__main__':
     #################################################################
 
     # Load knowledge bases
-    Announce.doing("Loading Knowledge Bases")
+    Announce.doing("Loading knowledge bases")
     loading_start = time.time()
     if params['dataset'] is None:
         assert os.path.exists(params['kg1']), "File %s does not exist!" % params['kg1']
@@ -137,7 +161,7 @@ if __name__ == '__main__':
         dataset_path,
         use_cache=not params['disable_preprocessing_cache'],
     )
-    sides.tag_graph_sides(kb1, kb2)
+    side_keys.tag_graph_sides(kb1, kb2)
     logging.info("Time used for loading KGs: %s minutes"%(round((time.time() - loading_start)/60, 5)))
     Announce.done()
     # cache and checkpoint information
@@ -154,10 +178,7 @@ if __name__ == '__main__':
         'entity_assign_runs',
         run_tag,
     )
-    logging.info(
-        "Compact entity assignment runtime dir | dir=%s",
-        compact_entity_assign_run_dir,
-    )
+    logging.info("Compact entity assignment runtime dir | dir=%s", compact_entity_assign_run_dir)
 
     # Load training data (if any)
     sameAsScores={}
@@ -169,7 +190,7 @@ if __name__ == '__main__':
                 if split[0] not in sameAsScores:
                     sameAsScores[split[0]]={}
                 sameAsScores[split[0]][split[1]]=1.0 if len(split)<3 else float(split[2])
-        sameAsScores = sides.maybe_encode_same_as_scores(sameAsScores, kb1, kb2)
+        sameAsScores = side_keys.maybe_encode_same_as_scores(sameAsScores, kb1, kb2)
         Announce.done()
 
 
@@ -177,13 +198,13 @@ if __name__ == '__main__':
     #            Initialization + Bootstrapping                     #
     #################################################################
 
-    Announce.doing("Initializing Subrelations")
+    Announce.doing("Initializing subrelations")
     predicates1 = kb1.predicates()
     predicates2 = kb2.predicates()
-    if align._can_use_compact_id_match(kb1, kb2):
-        predicate2superPredicate = align.CompactDenseDefaultPredicateMapping(kb1, kb2, relinit=0.1)
+    if alignment_base._can_use_compact_id_match(kb1, kb2):
+        predicate2superPredicate = alignment_base.CompactDenseDefaultPredicateMapping(kb1, kb2, relinit=0.1)
     else:
-        predicate2superPredicate = align.initializePredicateSubsumption(predicates1, predicates2, relinit=0.1)
+        predicate2superPredicate = alignment_base.initializePredicateSubsumption(predicates1, predicates2, relinit=0.1)
     Announce.done()
 
     compute_functionalities_start = time.time()
@@ -202,8 +223,8 @@ if __name__ == '__main__':
         [1, 2],
         use_cache=not params['disable_preprocessing_cache'],
     )
-    if sides.can_use_id_keyed_state(kb1, kb2):
-        functionalities = sides.preencode_compact_worker_functionalities(functionalities1, functionalities2)
+    if side_keys.can_use_id_keyed_state(kb1, kb2):
+        functionalities = side_keys.preencode_compact_worker_functionalities(functionalities1, functionalities2)
     else:
         functionalities = {}
         for pred in functionalities1:
@@ -222,35 +243,13 @@ if __name__ == '__main__':
 
     BOD = params['alpha']
     iterations = 0
-    checkpoint_payload = None
-    if params['resume_checkpoint']:
-        checkpoint_payload = cache.load_latest_checkpoint(checkpoint_dir, checkpoint_signature)
+    checkpoint_state = cache.restore_checkpoint_state(params, checkpoint_dir, checkpoint_signature, kb1, kb2)
 
-    if checkpoint_payload is not None: # load checkpoint
-        sameAsScores = checkpoint_payload['sameAsScores']
-        predicate2superPredicate = checkpoint_payload['predicate2superPredicate']
-        quasiEqvirel = checkpoint_payload['quasiEqvirel']
-        sameAsScores = sides.maybe_encode_same_as_scores(sameAsScores, kb1, kb2)
-        predicate2superPredicate = sides.maybe_encode_predicate_mapping(
-            predicate2superPredicate,
-            kb1,
-            kb2,
-            preserve_mapping=align.is_dense_default_predicate_mapping,
-        )
-        quasiEqvirel = sides.maybe_encode_predicate_mapping(
-            quasiEqvirel,
-            kb1,
-            kb2,
-            preserve_mapping=align.is_dense_default_predicate_mapping,
-        )
-        iterations = checkpoint_payload['iterations']
-        logging.info(
-            "Resuming main loop from checkpoint | iteration=%s | checkpoint_dir=%s",
-            iterations, checkpoint_dir,
-        )
-        log.log_nested_mapping_stats("Checkpoint sameAsScores", sameAsScores)
-        log.log_predicate_mapping_stats("Checkpoint predicate2superPredicate stats", predicate2superPredicate)
-        log.log_predicate_mapping_stats("Checkpoint quasiEqvirel stats", quasiEqvirel)
+    if checkpoint_state is not None: # load checkpoint
+        sameAsScores = checkpoint_state['sameAsScores']
+        predicate2superPredicate = checkpoint_state['predicate2superPredicate']
+        quasiEqvirel = checkpoint_state['quasiEqvirel']
+        iterations = checkpoint_state['iterations']
     else:
         # Literal Matching
         Announce.doing(
@@ -279,9 +278,9 @@ if __name__ == '__main__':
                 Announce.doing("Loading precomputed literal embeddings from %s" % emb_path)
                 Announce.done()
             else:
-                import literals
+                import literal_embedding
                 Announce.doing("PreComputing literal embeddings with %s..." % params['literal_embedding_model'])
-                literals.compute_literal_embeddings(
+                literal_embedding.compute_literal_embeddings(
                     kb1,
                     kb2,
                     emb_path,
@@ -296,7 +295,7 @@ if __name__ == '__main__':
                 kg_cache_info['signature'],
                 use_cache=not params['disable_preprocessing_cache'],
             )
-        literal_scores = sides.maybe_encode_same_as_scores(literal_scores, kb1, kb2)
+        literal_scores = side_keys.maybe_encode_same_as_scores(literal_scores, kb1, kb2)
         if sameAsScores:
             for entity1, entity2scores in literal_scores.items():
                 if entity1 not in sameAsScores:
@@ -321,7 +320,7 @@ if __name__ == '__main__':
         ent_maxAssign = None
         quasiEqvirel = None
         if sameAsScores:
-            align.bootstrap_algo(
+            entity_alignment.bootstrap_algo(
                 kb1,
                 kb2,
                 sameAsScores,
@@ -336,17 +335,17 @@ if __name__ == '__main__':
         log.log_memory_snapshot("%s post-bootstrap memory" % round_prefix)
         log.log_nested_mapping_stats("%s post-prune sameAsScores" % round_prefix, sameAsScores)
         log.log_memory_snapshot("%s post-prune memory" % round_prefix)
-        ent_maxAssign = align.bilateral_max_assign(sameAsScores)
+        ent_maxAssign = alignment_base.bilateral_max_assign(sameAsScores)
         log.log_nested_mapping_stats("%s bilateral_max_assign stats" % round_prefix, ent_maxAssign)
         log.log_alignment_fanout("%s bilateral_max_assign" % round_prefix, ent_maxAssign, kb1, kb2)
         log.log_memory_snapshot("%s post-bilateral memory" % round_prefix)
         logging.info("%s bilateral max assign successfully computed.", round_prefix)
 
-        if align._can_use_compact_id_match(kb1, kb2):
-            predicate2superPredicate = align.initializePredicateIdentityOnlyIds(kb1, kb2)
+        if alignment_base._can_use_compact_id_match(kb1, kb2):
+            predicate2superPredicate = alignment_base.initializePredicateIdentityOnlyIds(kb1, kb2)
         else:
-            predicate2superPredicate = align.initializePredicateIdentityOnly(predicates1, predicates2)
-        align.map_subrelations(
+            predicate2superPredicate = alignment_base.initializePredicateIdentityOnly(predicates1, predicates2)
+        relation_mapping.map_subrelations(
             BOD,
             kb1,
             kb2,
@@ -358,21 +357,22 @@ if __name__ == '__main__':
         log.log_predicate_mapping_stats("%s predicate2superPredicate stats" % round_prefix, predicate2superPredicate)
         log.log_memory_snapshot("%s post-map_subrelations memory" % round_prefix)
         logging.info("%s subrelation mapping successfully computed.", round_prefix)
-        quasiEqvirel = align.computeQuasiEqrel(kb1, kb2, predicate2superPredicate)
+        quasiEqvirel = alignment_base.computeQuasiEqrel(kb1, kb2, predicate2superPredicate)
         log.log_predicate_mapping_stats("%s quasiEqvirel stats" % round_prefix, quasiEqvirel)
         log.log_memory_snapshot("%s post-quasiEqvirel memory" % round_prefix)
         logging.info("%s quasi-equivalence relation successfully computed.", round_prefix)
         Announce.done()
         logging.info("Time used for bootstrapping: %s minutes"%(round((time.time() - starttime)/60, 5)))
-        if params['enable_checkpoint'] and params['checkpoint_interval'] != 0:
-            cache.save_checkpoint(
-                checkpoint_dir,
-                checkpoint_signature,
-                iterations,
-                sameAsScores,
-                predicate2superPredicate,
-                quasiEqvirel,
-            )
+        cache.save_checkpoint_if_enabled(
+            params,
+            checkpoint_dir,
+            checkpoint_signature,
+            iterations,
+            sameAsScores,
+            predicate2superPredicate,
+            quasiEqvirel,
+            force=True,
+        )
     logging.info("---------------Main Loop---------------")
 
 
@@ -402,11 +402,11 @@ if __name__ == '__main__':
             min_targets=20,
         )
         log.log_memory_snapshot("Iteration pre-worker memory")
-        ent_maxAssign = align.bilateral_max_assign(sameAsScores)
+        ent_maxAssign = alignment_base.bilateral_max_assign(sameAsScores)
         log.log_nested_mapping_stats("Iteration pre-worker ent_maxAssign", ent_maxAssign)
         log.log_alignment_fanout(f"Iteration {iterations + 1} pre-worker ent_maxAssign", ent_maxAssign, kb1, kb2)
         log.log_memory_snapshot("Iteration post-bilateral memory")
-        use_compact_id_score_chunks = align._can_use_compact_id_match(kb1, kb2)
+        use_compact_id_score_chunks = alignment_base._can_use_compact_id_match(kb1, kb2)
         worker_params = params
         worker_ent_max_assign = ent_maxAssign
         merge_guard_ent_max_assign = ent_maxAssign
@@ -420,7 +420,7 @@ if __name__ == '__main__':
                 compact_entity_assign_run_dir,
                 f"iter_{iterations + 1:04d}",
             )
-            entity_assign_metadata = align.build_compact_entity_assign_index(
+            entity_assign_metadata = alignment_base.build_compact_entity_assign_index(
                 kb1,
                 kb2,
                 ent_maxAssign,
@@ -428,7 +428,7 @@ if __name__ == '__main__':
             )
             worker_params['_compact_entity_assign_index'] = entity_assign_metadata
             # Keep only the compact max-score guards needed by the parent merge.
-            merge_guard_index = align.CompactEntityAssignIndex(entity_assign_metadata)
+            merge_guard_index = alignment_base.CompactEntityAssignIndex(entity_assign_metadata)
             merge_guard_src_max_scores = merge_guard_index.src_max
             merge_guard_dst_max_scores = merge_guard_index.dst_max
             worker_ent_max_assign = None
@@ -456,7 +456,7 @@ if __name__ == '__main__':
 
             def merge_worker_chunk(ent_match_score_dict):
                 if use_compact_id_score_chunks:
-                    align.merge_same_as_score_chunk_ids(
+                    alignment_base.merge_same_as_score_chunk_ids(
                         sameAsScores,
                         ent_match_score_dict,
                         kb1,
@@ -466,7 +466,7 @@ if __name__ == '__main__':
                         dst_max_scores=merge_guard_dst_max_scores,
                     )
                 else:
-                    align.merge_same_as_score_chunk(
+                    alignment_base.merge_same_as_score_chunk(
                         sameAsScores,
                         ent_match_score_dict,
                         min_score=params['prune_min_score'],
@@ -488,7 +488,7 @@ if __name__ == '__main__':
                 task = mp.Process(
                     target=log.run_worker_with_crash_logging,
                     args=(
-                        align._match_entities_by_rules,
+                        entity_alignment._match_entities_by_rules,
                         worker_args,
                         profile_queue,
                         f"Iteration {iterations + 1} worker-stage",
@@ -503,7 +503,7 @@ if __name__ == '__main__':
             memory_tracker.log_current(f"Iteration {iterations + 1} worker-stage memory start")
             worker_profiles = []
 
-            align.feed_entity_chunks(
+            alignment_base.feed_entity_chunks(
                 ent_queue,
                 kb1,
                 num_workers,
@@ -516,7 +516,7 @@ if __name__ == '__main__':
                 ],
                 worker_tasks=tasks,
             )
-            align.wait_for_workers_and_drain(
+            alignment_base.wait_for_workers_and_drain(
                 tasks,
                 ent_match_tuple_queue,
                 merge_worker_chunk,
@@ -529,11 +529,11 @@ if __name__ == '__main__':
 
             logging.info("All worker processes finished. Merging results...")
             merge_stage_start = time.perf_counter()
-            align.drain_queue_items(ent_match_tuple_queue, merge_worker_chunk)
+            alignment_base.drain_queue_items(ent_match_tuple_queue, merge_worker_chunk)
             merge_stage_time = time.perf_counter() - merge_stage_start
             logging.info("Merging worker results successfully completed.")
 
-            align.drain_queue_items(profile_queue, worker_profiles.append)
+            alignment_base.drain_queue_items(profile_queue, worker_profiles.append)
         finally:
             if ent_queue is not None:
                 ent_queue.close()
@@ -549,118 +549,18 @@ if __name__ == '__main__':
         logging.info("Aligning entities: %s minutes"%(round((time.time() - starttime1)/60, 5)))
         log.log_nested_mapping_stats("Iteration post-worker sameAsScores", sameAsScores)
         log.log_memory_snapshot("Iteration post-worker memory")
-        worker_crashes = [
-            item for item in worker_profiles
-            if isinstance(item, dict) and item.get('_worker_crash')
-        ]
-        for crash in worker_crashes:
-            logging.error(
-                "Worker crash report | stage=%s | pid=%s | exception=%s: %s\n%s",
-                crash.get('stage_label'),
-                crash.get('pid'),
-                crash.get('exception_type'),
-                crash.get('exception'),
-                crash.get('traceback'),
-            )
-        worker_profiles = [
-            item for item in worker_profiles
-            if isinstance(item, dict) and not item.get('_worker_crash')
-        ]
-        if worker_profiles:
-            total_build_facts = sum(item['build_facts'] for item in worker_profiles)
-            total_collect_pairs = sum(item['collect_pairs'] for item in worker_profiles)
-            total_select = sum(item['select'] for item in worker_profiles)
-            total_align = sum(item['align'] for item in worker_profiles)
-            total_seen = sum(item['entities_seen'] for item in worker_profiles)
-            total_processed = sum(item['entities_processed'] for item in worker_profiles)
-            total_skipped_matched = sum(item['skipped_matched'] for item in worker_profiles)
-            total_candidate_obj2 = sum(item.get('total_candidate_obj2', 0) for item in worker_profiles)
-            total_scanned_evi2 = sum(item.get('total_scanned_evi2', 0) for item in worker_profiles)
-            total_fact_upper_bound_pruned_facts = sum(
-                item.get('fact_upper_bound_pruned_facts', 0)
-                for item in worker_profiles
-            )
-            total_upper_bound_pruned_evidence = sum(
-                item.get('upper_bound_pruned_evidence', 0)
-                for item in worker_profiles
-            )
-            total_upper_bound_pruned_rules = sum(
-                item.get('upper_bound_pruned_rules', 0)
-                for item in worker_profiles
-            )
-            total_target_score_upper_bound_pruned_predicates = sum(
-                item.get('target_score_upper_bound_pruned_predicates', 0)
-                for item in worker_profiles
-            )
-            total_target_score_upper_bound_pruned_candidates = sum(
-                item.get('target_score_upper_bound_pruned_candidates', 0)
-                for item in worker_profiles
-            )
-            total_target_hub_functionality_pruned_predicates = sum(
-                item.get('target_hub_functionality_pruned_predicates', 0)
-                for item in worker_profiles
-            )
-            total_target_hub_functionality_pruned_candidates = sum(
-                item.get('target_hub_functionality_pruned_candidates', 0)
-                for item in worker_profiles
-            )
-            max_scanned_evi2_entity = max(
-                (item.get('max_scanned_evi2_entity', 0) for item in worker_profiles),
-                default=0,
-            )
-            max_context_pairs_entity = max(
-                (item.get('max_context_pairs_entity', 0) for item in worker_profiles),
-                default=0,
-            )
-            max_align_time_entity_s = max(
-                (item.get('max_align_time_entity_s', 0.0) for item in worker_profiles),
-                default=0.0,
-            )
-            logging.info(
-                "Worker profile | seen=%s | processed=%s | skipped_matched=%s | build_facts=%.3fs | collect_pairs=%.3fs | select=%.3fs | align=%.3fs",
-                total_seen,
-                total_processed,
-                total_skipped_matched,
-                total_build_facts,
-                total_collect_pairs,
-                total_select,
-                total_align,
-            )
-            logging.info(
-                "Worker expansion profile | candidate_obj2=%s | scanned_evi2=%s | "
-                "max_scanned_evi2_entity=%s | max_context_pairs_entity=%s | "
-                "max_align_time_entity_s=%.3fs | "
-                "fact_upper_bound_pruned_facts=%s | "
-                "upper_bound_pruned_evidence=%s | "
-                "upper_bound_pruned_rules=%s | "
-                "target_score_upper_bound_pruned_predicates=%s | "
-                "target_score_upper_bound_pruned_candidates=%s | "
-                "target_hub_functionality_pruned_predicates=%s | "
-                "target_hub_functionality_pruned_candidates=%s",
-                total_candidate_obj2,
-                total_scanned_evi2,
-                max_scanned_evi2_entity,
-                max_context_pairs_entity,
-                max_align_time_entity_s,
-                total_fact_upper_bound_pruned_facts,
-                total_upper_bound_pruned_evidence,
-                total_upper_bound_pruned_rules,
-                total_target_score_upper_bound_pruned_predicates,
-                total_target_score_upper_bound_pruned_candidates,
-                total_target_hub_functionality_pruned_predicates,
-                total_target_hub_functionality_pruned_candidates,
-            )
+        log.log_worker_profiles(worker_profiles)
         # Predicate Alignment
         Announce.doing("Recomputing predicate inclusions")
         starttime1 = time.time()
         bilateral_stage_start = time.perf_counter()
-        ent_maxAssign = align.bilateral_max_assign(sameAsScores)
+        ent_maxAssign = alignment_base.bilateral_max_assign(sameAsScores)
         bilateral_stage_time = time.perf_counter() - bilateral_stage_start
         log.log_nested_mapping_stats("Iteration predicate-stage ent_maxAssign", ent_maxAssign)
         log.log_alignment_fanout(f"Iteration {iterations + 1} predicate-stage ent_maxAssign", ent_maxAssign, kb1, kb2)
         log.log_memory_snapshot("Iteration predicate-stage post-bilateral memory")
         subrelation_stage_start = time.perf_counter()
-        align.map_subrelations(
+        relation_mapping.map_subrelations(
             BOD,
             kb1,
             kb2,
@@ -673,7 +573,7 @@ if __name__ == '__main__':
         log.log_predicate_mapping_stats("Iteration predicate2superPredicate stats", predicate2superPredicate)
         log.log_memory_snapshot("Iteration predicate-stage post-map_subrelations memory")
         quasi_stage_start = time.perf_counter()
-        quasiEqvirel = align.computeQuasiEqrel(kb1, kb2, predicate2superPredicate)
+        quasiEqvirel = alignment_base.computeQuasiEqrel(kb1, kb2, predicate2superPredicate)
         quasi_stage_time = time.perf_counter() - quasi_stage_start
         log.log_predicate_mapping_stats("Iteration quasiEqvirel stats", quasiEqvirel)
         log.log_memory_snapshot("Iteration predicate-stage post-quasiEqvirel memory")
@@ -691,19 +591,15 @@ if __name__ == '__main__':
         
         Announce.done() 
         iterations+=1
-        if (
-            params['enable_checkpoint']
-            and params['checkpoint_interval'] > 0
-            and iterations % params['checkpoint_interval'] == 0
-        ):
-            cache.save_checkpoint(
-                checkpoint_dir,
-                checkpoint_signature,
-                iterations,
-                sameAsScores,
-                predicate2superPredicate,
-                quasiEqvirel,
-            )
+        cache.save_checkpoint_if_enabled(
+            params,
+            checkpoint_dir,
+            checkpoint_signature,
+            iterations,
+            sameAsScores,
+            predicate2superPredicate,
+            quasiEqvirel,
+        )
         if abs(newSameAsSum - sameAsSum) < params['epsilon']:
             logging.info(
                 "Stopping after iteration %s due to convergence: delta=%s < epsilon=%s",
@@ -726,21 +622,21 @@ if __name__ == '__main__':
         predicates = kb1_predicates | kb2_predicates
         for predicate1 in predicates:
             predicate1_keys = [predicate1]
-            if sides.can_use_id_keyed_state(kb1, kb2):
-                predicate1_keys = sides.predicate_side_keys(predicate1, kb1, kb2)
+            if side_keys.can_use_id_keyed_state(kb1, kb2):
+                predicate1_keys = side_keys.predicate_side_keys(predicate1, kb1, kb2)
             for predicate1_key in predicate1_keys:
                 if predicate1_key not in predicate2superPredicate:
                     continue
                 for predicate2_key, score in predicate2superPredicate[predicate1_key].items():
                     if score > 0.1:
-                        predicate2 = sides.decode_predicate_key(predicate2_key, kb1, kb2)
+                        predicate2 = side_keys.decode_predicate_key(predicate2_key, kb1, kb2)
                         out.write(predicate1+"\trdfs:subPropertyOf\t"+predicate2+"\t.#\t"+str(score)+"\n")
         # Literals and instances
         for entity1 in sameAsScores:
             for entity2 in sameAsScores[entity1]:
                 if sameAsScores[entity1][entity2] > 0: # first report all possible scores
-                    entity1_out = sides.decode_entity_key(entity1, kb1, kb2)
-                    entity2_out = sides.decode_entity_key(entity2, kb1, kb2)
+                    entity1_out = side_keys.decode_entity_key(entity1, kb1, kb2)
+                    entity2_out = side_keys.decode_entity_key(entity2, kb1, kb2)
                     out.write(entity1_out+"\towl:sameAs\t"+entity2_out+"\t.#\t"+str(sameAsScores[entity1][entity2])+"\n")
     Announce.done()
     logging.info("Time used for the whole procedure: %s minutes"%(round((time.time() - procedure_start)/60, 5)))
@@ -750,3 +646,4 @@ if __name__ == '__main__':
             logging.info("Removed compact entity assignment runtime dir | dir=%s", compact_entity_assign_run_dir)
         except OSError as exc:
             logging.warning("Failed to remove compact entity assignment runtime dir | dir=%s | error=%s", compact_entity_assign_run_dir, exc)
+    Announce.message("Done")

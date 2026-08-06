@@ -1,6 +1,7 @@
 """
-Reading files of different formats: Turtle, Graph, XML.
-Portions of this code are adapted from Fabian M. Suchanek (2022) under CC-BY.
+This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+Description: Graph data structures, compact graph representations, RDF/Turtle parsers and dataset loaders.
 """
 
 import os
@@ -54,7 +55,7 @@ def canonicalizePredicate(predicate):
 def printError(*args, **kwargs):
     """ Prints an error to StdErr """
     print(*args, file=sys.stderr, **kwargs)
-    
+
 def termsAndSeparators(generator):
     """ Iterator over the terms of char reader """
     pushBack=None
@@ -63,9 +64,9 @@ def termsAndSeparators(generator):
         while True:
             char=pushBack if pushBack else next(generator, None)
             pushBack=None
-            if not char: 
+            if not char:
                 # end of file
-                yield None                
+                yield None
                 return
             elif char=='@':
                 # @base and @prefix
@@ -84,7 +85,7 @@ def termsAndSeparators(generator):
                 pass
             else:
                 break
-                
+
         # Strings
         if char=='"':
             secondChar=next(generator, None)
@@ -112,7 +113,7 @@ def termsAndSeparators(generator):
                 elif thirdChar=='"' and secondChar!='\\':
                     literal=secondChar
                     char=None
-                else:    
+                else:
                     literal=[secondChar,thirdChar]
                     if thirdChar=='\\' and secondChar!='\\':
                         literal+=next(generator, ' ')
@@ -164,12 +165,12 @@ def termsAndSeparators(generator):
                     if (char>='A' and char<='Z') or (char>='a' and char<='z') or (char>='0' and char<='9') or char=='-':
                         language+=char
                         continue
-                    pushBack=char                        
+                    pushBack=char
                     break
                 if not language or len(language)>20 or len(language)<2 or ('-' in language and len(language[language.index('-'):])>9):
                     if TEST:
                         printError("Invalid literal language:", language)
-                    yield('"'+literal+'"')  
+                    yield('"'+literal+'"')
                 else:
                     yield('"'+literal+'"@'+language)
             else:
@@ -200,7 +201,7 @@ def termsAndSeparators(generator):
                     break
             pushBack=char
             yield "".join(iri)
-    
+
 # Counts blank nodes to give a unique name to each of them
 blankNodeCounter=0
 
@@ -219,10 +220,10 @@ def blankNodeName(subject, predicate=None):
         predicate=""
     blankNodeCounter+=1
     return "ys:"+subject+predicate+"_"+str(blankNodeCounter)
-    
+
 def triplesFromTerms(generator, predicates=None, givenSubject=None):
     """ Iterator over the triples of a term generator """
-    while True:        
+    while True:
         term=next(generator, None)
         if not term or term==']':
             return
@@ -232,8 +233,8 @@ def triplesFromTerms(generator, predicates=None, givenSubject=None):
         if givenSubject:
             subject=givenSubject
             if term!=',':
-                predicate=term            
-        # If we're in a normal statement     
+                predicate=term
+        # If we're in a normal statement
         else:
             if term!=';' and term!=',':
                 subject=term
@@ -257,7 +258,7 @@ def triplesFromTerms(generator, predicates=None, givenSubject=None):
                 term=next(generator, None)
                 if not term:
                     printError("Unexpected end of file in collection (...)")
-                    break  
+                    break
                 elif term==')':
                     break
                 else:
@@ -267,7 +268,7 @@ def triplesFromTerms(generator, predicates=None, givenSubject=None):
                         term=blankNodeName("element")
                         yield (listNode, 'rdf:first', term)
                         yield from triplesFromTerms(generator, predicates, givenSubject=term)
-                    else:    
+                    else:
                         yield (listNode, 'rdf:first', term)
                     previousListNode=listNode
                     listNode=blankNodeName("list")
@@ -312,7 +313,7 @@ def graphFromTurtleFile(file, message=None):
     for triple in triplesFromTurtleFile(file, message):
         graph.add(triple)
     return graph
-    
+
 ##########################################################################
 #             Graphs
 ##########################################################################
@@ -324,7 +325,7 @@ def isInverse(rel):
 def invert(rel):
     """ Returns the inverse of a relation """
     return rel[:-1] if isInverse(rel) else rel+'-'
-    
+
 class Graph(object):
     """ A graph of triples """
     def __init__(self, biparti=True):
@@ -388,7 +389,7 @@ class Graph(object):
         if predicate_map is None:
             return None
         return predicate_map.get(predicate)
-    
+
     def __contains__(self, triple):
         (subject, predicate, obj) = triple
         predicate = canonicalizePredicate(predicate)
@@ -398,10 +399,10 @@ class Graph(object):
     def has_subject(self, subject):
         return subject in self.index
 
-    def iter_view_subjects(self): 
+    def iter_view_subjects(self):
         """ Returns an iterator over the subjects of the graph """
         return iter(self.index)
-    
+
     def __iter__(self):
         for subject in self.iter_view_subjects():
             for predicate, objects in self.subject_items(subject):
@@ -459,7 +460,7 @@ class Graph(object):
                 if isLiteral(obj):
                     return True
         return False
-    
+
     def localFunctionality(self, subjects, preds):
         if not isinstance(subjects, (list, tuple)):
             subjects = [subjects]
@@ -536,7 +537,7 @@ class Graph(object):
                     yield (subject, predicate, obj)
 
     def headTriplesWithPredicateList(self, predicatesWithCount):
-        """ Returns the triples dictionary where the head entity 
+        """ Returns the triples dictionary where the head entity
             has all predicates in the given predicates """
         result = {} # {head: pred: tail}
         predicatesWithCount = {
@@ -871,12 +872,12 @@ class CompactGraph(object):
 
     def predicates(self): # to be compatible with the original graph
         return {self._id2predicate[predicate_id]: int(count) for predicate_id, count in self.predicate_counts_ids().items()}
-    
+
     def _build_from_graph(self, graph):
         """ Builds the compact graph from the given graph. """
         triples = []
         symbols = self._require_symbols()
-        
+
         # Encode entities and predicates and collect triples as (subject_id, predicate_id, object_id)
         for subject in graph.iter_view_subjects():
             subject_id = symbols.add_entity(subject)
@@ -938,7 +939,7 @@ class CompactGraph(object):
             # predicate id for each subject-predicate pair
             subject_pair_predicates = predicates[pair_start_indices]
             # offset into objects array for each subject-predicate pair
-            subject_pair_fact_offsets = np.empty(len(pair_start_indices) + 1, dtype=offset_dtype) 
+            subject_pair_fact_offsets = np.empty(len(pair_start_indices) + 1, dtype=offset_dtype)
             subject_pair_fact_offsets[:-1] = pair_start_indices
             subject_pair_fact_offsets[-1] = fact_count
             # count of subject-predicate pairs for each subject
@@ -1054,8 +1055,8 @@ class CompactGraph(object):
                 self._OBJECT_IDS_CACHE_MAXSIZE,
             )
         return result
-    
-    
+
+
     def _subject_predicate_fact_count(self, subject_id, predicate_id):
         """Return the number of objects for the given (subject_id, predicate_id)."""
         pair_idx = self._subject_predicate_pair_index(subject_id, predicate_id)
@@ -1108,7 +1109,7 @@ class CompactGraph(object):
             self._COUNT_CACHE_MAXSIZE,
         )
         return count
-    
+
     def _has_object_for_subject_predicate_id(self, subject_id, predicate_id, object_id):
         """Return whether an subject-predicate edge contains object_id."""
         if subject_id is None or predicate_id is None or object_id is None:
@@ -1245,7 +1246,7 @@ class CompactGraph(object):
 
     def __len__(self):
         return len(self._objects)
-        
+
 
 # Regex for literals
 literalRegex=re.compile('"([^"]*)"(@([a-z-]+))?(\\^\\^(.*))?')
@@ -1279,7 +1280,7 @@ def load_openea(loc, attr=True):
                         kg1.add((head, rel, tail))
                     else:
                         kg2.add((head, rel, tail))
-    if attr: # load attributes as well 
+    if attr: # load attributes as well
          for i in range(2):
              with open(os.path.join(loc,'attr_triples_{}'.format(i+1)), 'r', encoding='UTF-8') as f:
                  for line in f.readlines():
@@ -1362,7 +1363,7 @@ def load_dbp15k(loc, trans=False, attr=True, name=True):
                     kg1.add((id2ent[head], id2rel[rel], id2ent[tail]))
                 else:
                     kg2.add((id2ent[head], id2rel[rel], id2ent[tail]))
-        
+
         # load attributes
         if attr:
             for triple in triplesFromTurtleFile(os.path.join(loc, 'att_triples_{}'.format(i+1))):

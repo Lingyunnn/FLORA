@@ -1,12 +1,6 @@
 """
-FLORA cache and checkpoint management utilities.
-
-Caches can speed up repeated runs by storing expensive intermediate results, including
-parsed knowledge graphs, compact graph representations, predicate functionalities, and 
-literal matching scores. 
-
-Checkpoints make long iterative FLORA runs resumable. A checkpoint records the current 
-iteration state, so a later run can continue from the latest compatible saved state.
+This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+Description: Cache and checkpoint management utilities for reusable FLORA intermediate results and resumable runs.
 """
 
 import hashlib
@@ -17,9 +11,10 @@ import os
 import pickle
 import time
 
-import align
-import init
-import sides
+import alignment_base
+import literal_matching
+import log
+import side_keys
 import utils
 
 
@@ -162,7 +157,7 @@ def compact_knowledge_bases_if_requested(params, cache_info, kb1, kb2):
 def load_or_compute_functionalities(graph, source_signature, graph_tag, gram, use_cache=True):
     """Load cached predicate functionalities, computing them in a child process on miss."""
     use_ids = hasattr(graph, 'iterFactIds') and hasattr(graph, 'num_entities')
-    graph_side = sides.graph_predicate_side(graph, sides.PRED1 if graph_tag == 'kb1' else sides.PRED2)
+    graph_side = side_keys.graph_predicate_side(graph, side_keys.PRED1 if graph_tag == 'kb1' else side_keys.PRED2)
     cache_signature = (
         source_signature,
         tuple(gram),
@@ -178,8 +173,8 @@ def load_or_compute_functionalities(graph, source_signature, graph_tag, gram, us
     else:
         logging.info("Functionalities cache disabled for %s; recomputing", graph_tag)
         if use_ids:
-            return align.computeFunctionalitiesIds(graph, gram=gram)
-        return align.computeFunctionalities(graph, gram=gram)
+            return alignment_base.computeFunctionalitiesIds(graph, gram=gram)
+        return alignment_base.computeFunctionalities(graph, gram=gram)
 
     # Compute in a worker so large temporary objects are released on exit.
     status_queue = mp.Queue(maxsize=1)
@@ -207,9 +202,9 @@ def load_or_compute_functionalities(graph, source_signature, graph_tag, gram, us
 def _compute_functionalities_cache_worker(graph, gram, use_ids, path, cache_signature, status_queue):
     try:
         if use_ids:
-            computed_value = align.computeFunctionalitiesIds(graph, gram=gram)
+            computed_value = alignment_base.computeFunctionalitiesIds(graph, gram=gram)
         else:
-            computed_value = align.computeFunctionalities(graph, gram=gram)
+            computed_value = alignment_base.computeFunctionalities(graph, gram=gram)
         save_pickle_cache(path, cache_signature, computed_value)
         status_queue.put((True, None))
     except BaseException as exc:
@@ -219,7 +214,7 @@ def _compute_functionalities_cache_worker(graph, gram, use_ids, path, cache_sign
 
 def load_or_compute_literal_scores(kb1, kb2, emb_path, params, source_signature, use_cache=True):
     """Load cached literal matching scores, computing and side-keying them on miss."""
-    use_id_keyed_scores = sides.can_use_id_keyed_state(kb1, kb2)
+    use_id_keyed_scores = side_keys.can_use_id_keyed_state(kb1, kb2)
     cache_signature = (
         source_signature,
         None if params['string_identity'] else embedding_signature(emb_path),
@@ -243,7 +238,7 @@ def load_or_compute_literal_scores(kb1, kb2, emb_path, params, source_signature,
         logging.info("Literal matching cache disabled; recomputing")
 
     literal_scores = {}
-    init.mapLiterals(
+    literal_matching.mapLiterals(
         kb1,
         kb2,
         emb_path,
@@ -258,7 +253,7 @@ def load_or_compute_literal_scores(kb1, kb2, emb_path, params, source_signature,
         literal_hnsw_ef_construction=params.get('literal_hnsw_ef_construction', 200),
     )
     if use_id_keyed_scores:
-        literal_scores = sides.maybe_encode_same_as_scores(literal_scores, kb1, kb2)
+        literal_scores = side_keys.maybe_encode_same_as_scores(literal_scores, kb1, kb2)
     if use_cache:
         save_pickle_cache(path, cache_signature, literal_scores)
     return literal_scores
@@ -486,3 +481,75 @@ def load_latest_checkpoint(checkpoint_dir, signature):
     logging.info(
         "Loaded checkpoint iteration=%s path=%s", payload.get('iterations'), path)
     return payload
+
+
+def restore_checkpoint_state(params, checkpoint_dir, signature, kb1, kb2):
+    """Load and normalize the latest compatible checkpoint state for this run."""
+    if not params['resume_checkpoint']:
+        return None
+
+    checkpoint_payload = load_latest_checkpoint(checkpoint_dir, signature)
+    if checkpoint_payload is None:
+        return None
+
+    sameAsScores = checkpoint_payload['sameAsScores']
+    predicate2superPredicate = checkpoint_payload['predicate2superPredicate']
+    quasiEqvirel = checkpoint_payload['quasiEqvirel']
+    sameAsScores = side_keys.maybe_encode_same_as_scores(sameAsScores, kb1, kb2)
+    predicate2superPredicate = side_keys.maybe_encode_predicate_mapping(
+        predicate2superPredicate,
+        kb1,
+        kb2,
+        preserve_mapping=alignment_base.is_dense_default_predicate_mapping,
+    )
+    quasiEqvirel = side_keys.maybe_encode_predicate_mapping(
+        quasiEqvirel,
+        kb1,
+        kb2,
+        preserve_mapping=alignment_base.is_dense_default_predicate_mapping,
+    )
+    iterations = checkpoint_payload['iterations']
+    logging.info(
+        "Resuming main loop from checkpoint | iteration=%s | checkpoint_dir=%s",
+        iterations, checkpoint_dir,
+    )
+    log.log_nested_mapping_stats("Checkpoint sameAsScores", sameAsScores)
+    log.log_predicate_mapping_stats("Checkpoint predicate2superPredicate stats", predicate2superPredicate)
+    log.log_predicate_mapping_stats("Checkpoint quasiEqvirel stats", quasiEqvirel)
+    return {
+        'sameAsScores': sameAsScores,
+        'predicate2superPredicate': predicate2superPredicate,
+        'quasiEqvirel': quasiEqvirel,
+        'iterations': iterations,
+    }
+
+
+def save_checkpoint_if_enabled(
+        params,
+        checkpoint_dir,
+        signature,
+        iterations,
+        sameAsScores,
+        predicate2superPredicate,
+        quasiEqvirel,
+        force=False):
+    """Apply checkpoint policy and save the current run state when enabled."""
+    if not params['enable_checkpoint']:
+        return
+    checkpoint_interval = params['checkpoint_interval']
+    if force:
+        if checkpoint_interval == 0:
+            return
+    else:
+        if checkpoint_interval <= 0:
+            return
+        if iterations % checkpoint_interval != 0:
+            return
+    save_checkpoint(
+        checkpoint_dir,
+        signature,
+        iterations,
+        sameAsScores,
+        predicate2superPredicate,
+        quasiEqvirel,
+    )

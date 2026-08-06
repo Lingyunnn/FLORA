@@ -1,10 +1,6 @@
 """
-FLORA side key management utilities.
-
-CompactGraph uses local integer IDs, so the same integer can appear in both
-knowledge bases with different meanings.  Side key keeps that local ID
-together with the graph side it came from, so that the same integer ID from 
-different graphs can be distinguished.
+This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+Description: side key management utilities for keeping local compact graph IDs distinct across knowledge bases.
 """
 
 import logging

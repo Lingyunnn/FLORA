@@ -1,10 +1,15 @@
+"""
+This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+Description: Memory, progress, worker crash, and alignment fanout logging helpers for FLORA experiments.
+"""
+
 from queue import Full
 import gc
 import logging
 import os
 import time
 import traceback
-import sides
+import side_keys
 
 
 DEFAULT_PROGRESS_LOG_INTERVAL = 300.0
@@ -63,7 +68,7 @@ def process_tree_memory_snapshot(worker_pids=None, parent_pid=None):
 class ProcessMemoryPeakTracker(object):
     """Track parent + worker PSS peak during a worker stage."""
 
-    def __init__(self, stage_label, worker_pids=None, sample_interval=1.0):
+    def __init__(self, stage_label, worker_pids=None, sample_interval=DEFAULT_PROGRESS_LOG_INTERVAL):
         self.stage_label = stage_label
         self.worker_pids = list(worker_pids or [])
         self.sample_interval = sample_interval
@@ -151,6 +156,109 @@ def log_memory_snapshot(stage_label):
     logging.info("%s | pss_mb=%.2f | pid=%s", stage_label, pss_mb, os.getpid())
 
 
+def log_worker_profiles(worker_profiles):
+    """Log worker crash reports and aggregate profile counters."""
+    worker_crashes = [
+        item for item in worker_profiles
+        if isinstance(item, dict) and item.get('_worker_crash')
+    ]
+    for crash in worker_crashes:
+        logging.error(
+            "Worker crash report | stage=%s | pid=%s | exception=%s: %s\n%s",
+            crash.get('stage_label'), crash.get('pid'), crash.get('exception_type'), crash.get('exception'), crash.get('traceback'))
+
+    profile_items = [
+        item for item in worker_profiles
+        if isinstance(item, dict) and not item.get('_worker_crash')
+    ]
+    if not profile_items:
+        return
+
+    total_build_facts = sum(item['build_facts'] for item in profile_items)
+    total_collect_pairs = sum(item['collect_pairs'] for item in profile_items)
+    total_select = sum(item['select'] for item in profile_items)
+    total_align = sum(item['align'] for item in profile_items)
+    total_seen = sum(item['entities_seen'] for item in profile_items)
+    total_processed = sum(item['entities_processed'] for item in profile_items)
+    total_skipped_matched = sum(item['skipped_matched'] for item in profile_items)
+    total_candidate_obj2 = sum(item.get('total_candidate_obj2', 0) for item in profile_items)
+    total_scanned_evi2 = sum(item.get('total_scanned_evi2', 0) for item in profile_items)
+    total_fact_upper_bound_pruned_facts = sum(
+        item.get('fact_upper_bound_pruned_facts', 0)
+        for item in profile_items
+    )
+    total_upper_bound_pruned_evidence = sum(
+        item.get('upper_bound_pruned_evidence', 0)
+        for item in profile_items
+    )
+    total_upper_bound_pruned_rules = sum(
+        item.get('upper_bound_pruned_rules', 0)
+        for item in profile_items
+    )
+    total_target_score_upper_bound_pruned_predicates = sum(
+        item.get('target_score_upper_bound_pruned_predicates', 0)
+        for item in profile_items
+    )
+    total_target_score_upper_bound_pruned_candidates = sum(
+        item.get('target_score_upper_bound_pruned_candidates', 0)
+        for item in profile_items
+    )
+    total_target_hub_functionality_pruned_predicates = sum(
+        item.get('target_hub_functionality_pruned_predicates', 0)
+        for item in profile_items
+    )
+    total_target_hub_functionality_pruned_candidates = sum(
+        item.get('target_hub_functionality_pruned_candidates', 0)
+        for item in profile_items
+    )
+    max_scanned_evi2_entity = max(
+        (item.get('max_scanned_evi2_entity', 0) for item in profile_items),
+        default=0,
+    )
+    max_context_pairs_entity = max(
+        (item.get('max_context_pairs_entity', 0) for item in profile_items),
+        default=0,
+    )
+    max_align_time_entity_s = max(
+        (item.get('max_align_time_entity_s', 0.0) for item in profile_items),
+        default=0.0,
+    )
+    logging.info(
+        "Worker profile | seen=%s | processed=%s | skipped_matched=%s | build_facts=%.3fs | collect_pairs=%.3fs | select=%.3fs | align=%.3fs",
+        total_seen,
+        total_processed,
+        total_skipped_matched,
+        total_build_facts,
+        total_collect_pairs,
+        total_select,
+        total_align,
+    )
+    logging.info(
+        "Worker expansion profile | candidate_obj2=%s | scanned_evi2=%s | "
+        "max_scanned_evi2_entity=%s | max_context_pairs_entity=%s | "
+        "max_align_time_entity_s=%.3fs | "
+        "fact_upper_bound_pruned_facts=%s | "
+        "upper_bound_pruned_evidence=%s | "
+        "upper_bound_pruned_rules=%s | "
+        "target_score_upper_bound_pruned_predicates=%s | "
+        "target_score_upper_bound_pruned_candidates=%s | "
+        "target_hub_functionality_pruned_predicates=%s | "
+        "target_hub_functionality_pruned_candidates=%s",
+        total_candidate_obj2,
+        total_scanned_evi2,
+        max_scanned_evi2_entity,
+        max_context_pairs_entity,
+        max_align_time_entity_s,
+        total_fact_upper_bound_pruned_facts,
+        total_upper_bound_pruned_evidence,
+        total_upper_bound_pruned_rules,
+        total_target_score_upper_bound_pruned_predicates,
+        total_target_score_upper_bound_pruned_candidates,
+        total_target_hub_functionality_pruned_predicates,
+        total_target_hub_functionality_pruned_candidates,
+    )
+
+
 def _record_entity_expansion_profile(profile_stats, timings, entity_memory_profile, context_pairs=0):
     """Update aggregate worker expansion counters for one processed entity."""
     total_time = sum(timings.values())
@@ -216,7 +324,7 @@ def _short_term(term, max_length=180):
 
 
 def _short_entity_term(term, kb1=None, kb2=None, max_length=180):
-    return _short_term(sides.decode_entity_key(term, kb1, kb2), max_length=max_length)
+    return _short_term(side_keys.decode_entity_key(term, kb1, kb2), max_length=max_length)
 
 
 def log_alignment_fanout(stage_label, mapping, kb1=None, kb2=None, top_n=10, min_targets=50, target_sample=8):
@@ -255,7 +363,7 @@ def log_alignment_fanout(stage_label, mapping, kb1=None, kb2=None, top_n=10, min
         sample = [
             "%s|%s|%.6g" % (
                 _short_entity_term(target, kb1, kb2),
-                sides.entity_side_label(target, kb1, kb2),
+                side_keys.entity_side_label(target, kb1, kb2),
                 score,
             )
             for target, score in sample_items
@@ -267,7 +375,7 @@ def log_alignment_fanout(stage_label, mapping, kb1=None, kb2=None, top_n=10, min
             stage_label,
             rank,
             _short_entity_term(entity, kb1, kb2),
-            sides.entity_side_label(entity, kb1, kb2),
+            side_keys.entity_side_label(entity, kb1, kb2),
             target_count,
             min(scores),
             max_score,
