@@ -52,10 +52,18 @@ cd src
 
 ```bash
 python main.py \
-  --dataset small-test/mini/ \
-  --embedding emb/mini/ \
+  --kg1 ../data/small-test/mini/mini1.ttl \
+  --kg2 ../data/small-test/mini/mini2.ttl \
+  --embedding ../data/emb/mini/ \
   --output ../save/mini-test.ttl
 ```
+
+The two toy KGs each contain one labeled Elvis entity and one `marriedTo` fact, using different prefixes:
+
+- `mini1.ttl`: `yago:Elvis rdfs:label "Elvis"` and `yago:Elvis yago:marriedTo yago:Priscilla`
+- `mini2.ttl`: `dbp:Elvis rdfs:label "Elvis"` and `dbp:Elvis dbp:marriedTo dbp:Priscilla`
+
+The `../data/emb/mini/` folder contains the precomputed literal embeddings used for the example. FLORA writes the alignment output to `../save/mini-test.ttl`; the file contains prefix declarations followed by scored relation alignments, such as `yago:marriedTo rdfs:subPropertyOf dbp:marriedTo`, literal matching results, such as `"Elvis"	owl:sameAs	"Elvis"`, and entity alignments, such as `yago:Elvis owl:sameAs dbp:Elvis`.
 
 ### Custom Turtle Files
 
@@ -107,14 +115,14 @@ python main.py \
 ### Precomputing Literal SameAs Scores
 
 Literal SameAs scores can also be computed independently. Because faiss-based literal matching benefits from GPU acceleration, while the main loop of FLORA needs only CPUs. 
-Run this after literal embeddings have been created, unless you use `--string_identity`:
+Run this after literal embeddings have been created, unless you use `--string_identity` (which means use only exact string matches.):
 
 ```bash
 python literal_matching.py \
   --kg1 ../data/my_dataset/kg1.ttl \
   --kg2 ../data/my_dataset/kg2.ttl \
   --embedding ../data/emb/my_dataset/ \
-  --output ../data/literal_scores/my_dataset_literal_scores.pkl \
+  --output ../data/literal_matching/my_dataset/literal_scores.pkl \
   --init 0.7 \
   --literal_faiss_index hnsw
 ```
@@ -170,19 +178,7 @@ FLORA uses datasets from:
 - [DBP15K](https://github.com/nju-websoft/JAPE): `fr_en`, `ja_en`, `zh_en`
 - [OAEI KG Track](https://oaei.ontologymatching.org/2024/knowledgegraph/index.html): `memoryalpha-stexpanded`, `starwars-swtor`
 
-Due to memory limitations, all datasets and pretrained embeddings used in the paper are on the [drive](https://nextcloud.r2.enst.fr/nextcloud/index.php/s/xj3oStmzLcknicr?opendetails=). Download and unzip all files in the data folder.
-
-Example:
-
-```bash
-cd src
-python main.py \
-  --dataset OpenEA/D_W_15K_V2/ \
-  --embedding emb/D_W_15K_V2/ \
-  --alpha 3.0 \
-  --init 0.7 \
-  --output ../save/results/dw-v2.ttl
-```
+Due to memory limitations, all datasets and pretrained embeddings used in the paper are on the [drive](https://nextcloud.r2.enst.fr/nextcloud/index.php/s/xj3oStmzLcknicr?opendetails=). Download and unzip the files from the drive into the matching subdirectories under `FLORA/data/` so that the preconfigured commands can resolve their default paths after the files are downloaded.
 
 ## Evaluation and Analysis
 

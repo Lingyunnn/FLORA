@@ -1,6 +1,7 @@
 """
-This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
-Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+This file is part of FLORA, an unsupervised system for automatic knowledge graph (KG) alignment. 
+The file is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0) by Yiwen Peng, Thomas Bonald, Fabian Suchanek and Lingyun Huang.
+
 Description: Predicate subrelation mapping utilities, including chunked and compact-graph implementations for updating relation scores.
 """
 

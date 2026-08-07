@@ -1,6 +1,7 @@
 """
-This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
-Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+This file is part of FLORA, an unsupervised system for automatic knowledge graph (KG) alignment. 
+The file is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0) by Yiwen Peng, Thomas Bonald, Fabian Suchanek and Lingyun Huang.
+
 Description: Literal embedding computation utilities for precomputing reusable string embeddings.
 This module can be run independently from FLORA's main loop. Because literal embedding computation benefits from GPU acceleration, embeddings
 can be precomputed on a GPU-enabled machine, saved to disk, and later reused by CPU-only FLORA runs.
@@ -233,14 +234,14 @@ def compute_literal_embeddings_streaming(kg1, kg2, emb_path, batch_size=128, emb
 
 def get_params():
     parser = argparse.ArgumentParser(description="Pre-compute FLORA literal embeddings for two Turtle KGs.")
-    parser.add_argument("kg1", help="Path to KG1 Turtle file")
-    parser.add_argument("kg2", help="Path to KG2 Turtle file")
-    parser.add_argument("emb_path", help="Output folder for kb1.pkl and kb2.pkl")
-    parser.add_argument("--embedding_model", default=DEFAULT_EMBEDDING_MODEL,
+    parser.add_argument("kg1", type=str, metavar='PATH', help="Path to KG1 Turtle file, e.g., ../data/my_dataset/kg1.ttl")
+    parser.add_argument("kg2", type=str, metavar='PATH', help="Path to KG2 Turtle file, e.g., ../data/my_dataset/kg2.ttl")
+    parser.add_argument("emb_path", type=str, metavar='DIR', help="Output folder for kb1.pkl and kb2.pkl, e.g., ../data/emb/my_dataset/")
+    parser.add_argument("--embedding_model", type=str, metavar='MODEL', default=DEFAULT_EMBEDDING_MODEL,
         help="HuggingFace model used to encode string literals. Default: Lihuchen/pearl_small. For multilingual embeddings, use sentence-transformers/LaBSE.")
-    parser.add_argument("--batch_size", type=int, default=128, help="Literal encoding batch size")
-    parser.add_argument("--literal_parser", choices=["fast", "turtle"], default="fast",
-        help="TTL literal parser used for streaming extraction: fast one-triple-per-line scanner or FLORA's general Turtle parser.",
+    parser.add_argument("--batch_size", type=int, metavar='INT', default=128, help="Literal encoding batch size; requires INT")
+    parser.add_argument("--literal_parser", choices=["fast", "turtle"], metavar='{fast,turtle}', default="fast",
+        help="TTL literal parser used for streaming extraction: fast for one-triple-per-line fast scanner ; turtle for full Turtle parser (slower but more robust)",
     )
     return parser.parse_args()
 

@@ -1,6 +1,7 @@
 """
-This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
-Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+This file is part of FLORA, an unsupervised system for automatic knowledge graph (KG) alignment. 
+The file is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0) by Yiwen Peng, Thomas Bonald, Fabian Suchanek and Lingyun Huang.
+
 Description: Literal matching and literal-score initialization utilities, including exact and embedding-based matching.
 This module can be run independently from FLORA's main loop. Because faiss-based literal matching benefits from GPU acceleration, 
 literal matching results can be precomputed on a GPU-enabled machine, saved to disk, and later reused by CPU-only FLORA runs.
@@ -643,22 +644,22 @@ def load_literal_only_graph_from_ttl(path, collect_subjects=False, fast_line_par
 
 def get_params():
     parser = argparse.ArgumentParser(description="Compute FLORA literal matching scores.")
-    parser.add_argument("--kg1", required=True, help="KG1 Turtle file")
-    parser.add_argument("--kg2", required=True, help="KG2 Turtle file")
-    parser.add_argument("--embedding", required=True, help="Folder containing kb1.pkl/kb2.pkl literal embeddings")
-    parser.add_argument("--output", required=True, help="Output pickle path for literal sameAs scores")
-    parser.add_argument("--init", type=float, default=0.7, help="Initial literal similarity threshold")
-    parser.add_argument("--string_identity", action="store_true", help="Use exact literal identity only")
-    parser.add_argument("--chunk_size", type=int, default=32768, help="FAISS query batch size")
-    parser.add_argument("--top_k", type=int, default=1, help="Number of target literals retrieved per source literal")
-    parser.add_argument("--literal_english_filter", action="store_true")
-    parser.add_argument("--literal_idf", action="store_true")
-    parser.add_argument("--literal_faiss_index", choices=["flat", "hnsw"], default="flat")
-    parser.add_argument("--literal_hnsw_m", type=int, default=32)
-    parser.add_argument("--literal_hnsw_ef_search", type=int, default=64)
-    parser.add_argument("--literal_hnsw_ef_construction", type=int, default=200)
-    parser.add_argument("--literal_parser", choices=["fast", "turtle"], default="fast",
-        help="TTL literal parser used for streaming extraction: fast one-triple-per-line scanner or FLORA's general Turtle parser.",
+    parser.add_argument("--kg1", type=str, metavar='PATH',required=True, help="KG1 Turtle file, e.g., ../data/my_dataset/kg1.ttl")
+    parser.add_argument("--kg2", type=str, metavar='PATH', required=True, help="KG2 Turtle file, e.g., ../data/my_dataset/kg2.ttl")
+    parser.add_argument("--embedding", type=str, metavar='DIR', required=True, help="Folder containing kb1.pkl/kb2.pkl literal embeddings, e.g., ../data/emb/my_dataset/")
+    parser.add_argument("--output", type=str, metavar='PATH', required=True, help="Output pickle path for literal sameAs scores, e.g., ../data/literal_matching/my_dataset/literal_scores.pkl")
+    parser.add_argument("--init", type=float, metavar='FLOAT', default=0.7, help="Initial literal similarity threshold; requires FLOAT in [0, 1]")
+    parser.add_argument("--string_identity", action="store_true", help="Boolean flag : Use exact literal identity only")
+    parser.add_argument("--chunk_size", type=int, metavar='INT', default=32768, help="FAISS query batch size; requires INT")
+    parser.add_argument("--top_k", type=int, metavar='INT', default=1, help="Number of target literals retrieved per source literal; requires INT")
+    parser.add_argument("--literal_english_filter", action="store_true", help="Boolean flag : keep only English literals during literal initialization")
+    parser.add_argument("--literal_idf", action="store_true", help="Boolean flag : reweight literal initialization scores with literal IDF to filter out common literals")
+    parser.add_argument("--literal_faiss_index", choices=["flat", "hnsw"], metavar='{flat,hnsw}', default="flat", help='FAISS index for literal embedding search : flat is exact search and can use GPU; hnsw is approximate CPU search')
+    parser.add_argument("--literal_hnsw_m", type=int, metavar='INT', default=32, help='HNSW graph degree for --literal_faiss_index hnsw ; requires INT')
+    parser.add_argument("--literal_hnsw_ef_search", type=int, metavar='INT', default=64, help='HNSW search parameter for --literal_faiss_index hnsw ; requires INT')
+    parser.add_argument("--literal_hnsw_ef_construction", type=int, metavar='INT', default=200, help='HNSW construction parameter for --literal_faiss_index hnsw ; requires INT')
+    parser.add_argument("--literal_parser", choices=["fast", "turtle"], metavar='{fast,turtle}', default="fast",
+        help="TTL literal parser used for streaming extraction: fast for one-triple-per-line fast scanner ; turtle for full Turtle parser (slower but more robust)",
     )
     return parser.parse_args()
 

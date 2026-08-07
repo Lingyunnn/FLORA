@@ -1,5 +1,7 @@
 """
-This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+This file is part of FLORA, an unsupervised system for automatic knowledge graph (KG) alignment. 
+The file is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0) by Yiwen Peng, Thomas Bonald, Fabian Suchanek and Lingyun Huang.
+
 Description: Memory, progress, worker crash, and alignment fanout logging helpers for FLORA experiments.
 """
 

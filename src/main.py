@@ -1,6 +1,7 @@
 """
-This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
-Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+This file is part of FLORA, an unsupervised system for automatic knowledge graph (KG) alignment. 
+The file is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0) by Yiwen Peng, Thomas Bonald, Fabian Suchanek and Lingyun Huang.
+
 Description: Command-line entry point that configures datasets, runs FLORA's alignment loop, and writes results.
 """
 
@@ -50,57 +51,56 @@ def get_params():
         formatter_class=CustomFormatter
     )
 
-    # Data source and run artifacts: choose either a benchmark dataset or custom
-    # KG files, then configure where auxiliary inputs and final output live.
+    # Data source and run artifacts.
     io_group = parser.add_argument_group('Input and output')
-    io_group.add_argument('--dataset', type=str, default=None,
+    io_group.add_argument('--dataset', type=str, metavar='DATASET', default=None,
         help=(
-            'Benchmark dataset under ../data. Examples:\n'
+            'Benchmark dataset name/path under ../data:\n'
             '  OpenEA/D_W_15K_V1/, OpenEA/D_W_15K_V2/\n'
             '  DBP15k/fr_en/, DBP15k/ja_en/, DBP15k/zh_en/\n'
             '  OAEI/memoryalpha-stexpanded/, OAEI/starwars-swtor/\n'
             '  small-test/mini/, small-test/person/, small-test/restaurant/'
         ),
     )
-    io_group.add_argument('--kg1', type=str, default='../data/source.ttl', help='Custom source Turtle file used as KG1')
-    io_group.add_argument('--kg2', type=str, default='../data/target.ttl', help='Custom target Turtle file used as KG2')
-    io_group.add_argument('--embedding', type=str, default=None, help='Literal embedding folder for the two KGs, e.g., emb/D_W_15K_V2/')
-    io_group.add_argument('--literal_scores', type=str, default=None, help='Precomputed literal sameAs score pickle from init.py, e.g., emb/D_W_15K_V2/literal_scores.pkl')
-    io_group.add_argument('--trainingdata', type=str, default=None, help='Optional seed alignment file under ../data')
-    io_group.add_argument('--output', type=str, default='../save/results/my_dataset.ttl', help='Output file path.')
+    io_group.add_argument('--kg1', type=str, metavar='PATH', default='../data/source.ttl', help='Custom source Turtle file used as KG1, e.g., ../data/my_dataset/kg1.ttl')
+    io_group.add_argument('--kg2', type=str, metavar='PATH', default='../data/target.ttl', help='Custom target Turtle file used as KG2, e.g., ../data/my_dataset/kg2.ttl')
+    io_group.add_argument('--embedding', type=str, metavar='DIR', default=None, help='Literal embedding folder for the two KGs, e.g., ../data/emb/my_dataset/')
+    io_group.add_argument('--literal_scores', type=str, metavar='PATH', default=None, help='Precomputed literal sameAs score pickle from init.py, e.g., ../data/literal_matching/my_dataset/literal_scores.pkl')
+    io_group.add_argument('--trainingdata', type=str, metavar='PATH', default=None, help='Optional seed alignment file under ../data, e.g., ../data/my_dataset/trainingdata.ttl')
+    io_group.add_argument('--output', type=str, metavar='PATH', default='../save/results/my_dataset.ttl', help='Output file path, e.g., ../save/results/my_dataset.ttl')
     # Literal initialization
     literal_group = parser.add_argument_group('Literal initialization')
-    literal_group.add_argument('--init', type=float, default=0.7, help='Initial literal similarity threshold')
-    literal_group.add_argument('--string_identity', action='store_true', help='Use only exact string literal identity for initialization; otherwise use literal embedding similarity')
-    literal_group.add_argument('--literal_embedding_model', type=str, default='Lihuchen/pearl_small', help='HuggingFace model used when FLORA needs to pre-compute literal embeddings. For multilingual embeddings, use sentence-transformers/LaBSE')
-    literal_group.add_argument('--literal_english_filter', action='store_true', help='Keep only English literals during literal initialization')
-    literal_group.add_argument('--literal_idf', action='store_true', help='Reweight literal initialization scores with literal IDF to filter out common literals')
-    literal_group.add_argument('--literal_faiss_index', choices=['flat', 'hnsw'], default='flat', help='FAISS index for literal embedding search: flat is exact search and can use GPU; hnsw is approximate CPU search')
-    literal_group.add_argument('--literal_hnsw_m', type=int, default=32, help='HNSW graph degree for --literal_faiss_index hnsw')
-    literal_group.add_argument('--literal_hnsw_ef_search', type=int, default=64, help='HNSW efSearch for --literal_faiss_index hnsw')
-    literal_group.add_argument('--literal_hnsw_ef_construction', type=int, default=200, help='HNSW efConstruction for --literal_faiss_index hnsw')
+    literal_group.add_argument('--init', type=float, metavar='FLOAT', default=0.7, help='Initial literal similarity threshold; requires FLOAT in [0, 1]')
+    literal_group.add_argument('--string_identity', action='store_true', help='Boolean flag: use only exact string literal identity for initialization; otherwise use literal embedding similarity')
+    literal_group.add_argument('--literal_embedding_model', type=str, metavar='MODEL', default='Lihuchen/pearl_small', help='HuggingFace model used when FLORA needs to pre-compute literal embeddings; requires MODEL. For multilingual embeddings, use sentence-transformers/LaBSE')
+    literal_group.add_argument('--literal_english_filter', action='store_true', help='Boolean flag : keep only English literals during literal initialization')
+    literal_group.add_argument('--literal_idf', action='store_true', help='Boolean flag : reweight literal initialization scores with literal IDF to filter out common literals')
+    literal_group.add_argument('--literal_faiss_index', choices=['flat', 'hnsw'], metavar='{flat,hnsw}', default='flat', help='FAISS index for literal embedding search : flat is exact search and can use GPU; hnsw is approximate CPU search')
+    literal_group.add_argument('--literal_hnsw_m', type=int, metavar='INT', default=32, help='HNSW graph degree for --literal_faiss_index hnsw; requires INT')
+    literal_group.add_argument('--literal_hnsw_ef_search', type=int, metavar='INT', default=64, help='HNSW search parameter for --literal_faiss_index hnsw; requires INT')
+    literal_group.add_argument('--literal_hnsw_ef_construction', type=int, metavar='INT', default=200, help='HNSW construction parameter for --literal_faiss_index hnsw; requires INT')
     # Core alignment algorithm
     alignment_group = parser.add_argument_group('Alignment algorithm')
-    alignment_group.add_argument('--alpha', type=float, default=3.0, help='Benefit-of-doubt factor for calculating subrelation scores')
-    alignment_group.add_argument('--gramN', type=int, default=100, help='Maximum number of evidences to consider for each entity during alignment')
-    alignment_group.add_argument('--epsilon', type=float, default=0.01, help='Convergence threshold for stopping the main loop')
-    alignment_group.add_argument('--max_iterations', type=int, default=50, help='Maximum number of main-loop iterations to run')
-    alignment_group.add_argument('--prune_min_score', type=float, default=0.01, help='Drop sameAs candidates below this score')
+    alignment_group.add_argument('--alpha', type=float, metavar='FLOAT', default=3.0, help='Benefit-of-doubt factor for calculating subrelation scores; requires FLOAT')
+    alignment_group.add_argument('--gramN', type=int, metavar='INT', default=100, help='Maximum number of evidences to consider for each entity during alignment; requires INT')
+    alignment_group.add_argument('--epsilon', type=float, metavar='FLOAT', default=0.01, help='Convergence threshold for stopping the main loop; requires FLOAT')
+    alignment_group.add_argument('--max_iterations', type=int, metavar='INT', default=50, help='Maximum number of main-loop iterations to run; requires INT')
+    alignment_group.add_argument('--prune_min_score', type=float, metavar='FLOAT', default=0.01, help='Drop sameAs candidates below this score; requires FLOAT in [0, 1]')
     # Performance and memory controls
     performance_group = parser.add_argument_group('Performance and memory')
-    performance_group.add_argument('--evidence_upper_bound', type=bool, default=True, help='Enable evidence upper-bound pruning before candidate rule scoring')
-    performance_group.add_argument('--target_hub_degree_threshold', type=int, default=10000, help='Apply target-side hub local-functionality pruning when a candidate subject/predicate has at least this many objects; 0 disables hub pruning')
-    performance_group.add_argument('--bootstrap_workers', type=int, default=None, help='Worker processes for bootstrap alignment; defaults to --workers when unset')
-    performance_group.add_argument('--workers', type=int, default=None, help='Worker processes for iteration-time entity alignment')
-    performance_group.add_argument('--subrelation_workers', type=int, default=None, help='Worker processes for predicate subrelation mapping')
-    performance_group.add_argument('--compact_kg', action='store_true', help='Store KGs as read-only mmap arrays instead of nested Python dict/set to reduce memory usage for large KGs')
+    performance_group.add_argument('--disable_upper_bound_pruning', action='store_true', help='Boolean flag: disable evidence upper-bound pruning before candidate rule scoring')
+    performance_group.add_argument('--target_hub_degree_threshold', type=int, metavar='INT', default=10000, help='Apply target-side hub local-functionality pruning when a candidate subject/predicate has at least this many objects; requires INT. 0 disables hub pruning')
+    performance_group.add_argument('--bootstrap_workers', type=int, metavar='INT', default=None, help='Worker processes for bootstrap alignment; requires INT')
+    performance_group.add_argument('--workers', type=int, metavar='INT', default=None, help='Worker processes for iteration-time entity alignment; requires INT')
+    performance_group.add_argument('--subrelation_workers', type=int, metavar='INT', default=None, help='Worker processes for predicate subrelation mapping; requires INT')
+    performance_group.add_argument('--compact_kg', action='store_true', help='Boolean flag : store KGs as read-only mmap arrays instead of nested Python dict/set to reduce memory usage for large KGs')
     # Cache and checkpointing
     state_group = parser.add_argument_group('Cache and checkpointing')
-    state_group.add_argument('--disable_preprocessing_cache', action='store_true', help='Disable reusable preprocessing caches for KG loading, functionalities, and literal matching')
-    state_group.add_argument('--enable_checkpoint', action='store_true', help='Save resumable FLORA checkpoints; disabled by default because checkpoints can be large')
-    state_group.add_argument('--checkpoint_dir', type=str, default=None, help='Directory for FLORA checkpoints; defaults to ../save/checkpoints/<output-stem>')
-    state_group.add_argument('--checkpoint_interval', type=int, default=1, help='When --enable_checkpoint is set, save every N completed iterations; 0 disables periodic checkpoints')
-    state_group.add_argument('--resume_checkpoint', action='store_true', help='Resume from the latest compatible checkpoint in --checkpoint_dir')
+    state_group.add_argument('--disable_preprocessing_cache', action='store_true', help='Boolean flag : disable reusable preprocessing caches for KG loading, functionalities, and literal matching')
+    state_group.add_argument('--enable_checkpoint', action='store_true', help='Boolean flag : save resumable FLORA checkpoints; disabled by default because checkpoints can be large')
+    state_group.add_argument('--checkpoint_dir', type=str, metavar='DIR', default=None, help='Directory for FLORA checkpoints, e.g., ../save/checkpoints/my_dataset/')
+    state_group.add_argument('--checkpoint_interval', type=int, metavar='INT', default=1, help='When --enable_checkpoint is set, save every N completed iterations; requires INT. 0 disables periodic checkpoints')
+    state_group.add_argument('--resume_checkpoint', action='store_true', help='Boolean flag : resume from the latest compatible checkpoint in --checkpoint_dir')
 
     # Show help if no args
     if len(sys.argv)==1:

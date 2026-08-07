@@ -1,6 +1,7 @@
 """
-This file is part of FLORA licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
-Portions of this file are adapted from the original FLORA implementation by Yiwen Peng, Thomas Bonald, and Fabian Suchanek, licensed under the same license.
+This file is part of FLORA, an unsupervised system for automatic knowledge graph (KG) alignment. 
+The file is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0) by Yiwen Peng, Thomas Bonald, Fabian Suchanek and Lingyun Huang.
+
 Description: Entity bootstrap and iterative entity matching procedures used by FLORA's fuzzy-logic alignment loop.
 """
 
@@ -401,7 +402,7 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
         kb_dst,
         functionalities,
     )
-    evidence_upper_bound_enabled = params.get('evidence_upper_bound', True)
+    upper_bound_pruning_enabled = not params.get('disable_upper_bound_pruning', False)
     minimum_output_score = max(0.0, float(params.get('prune_min_score', 0.0) or 0.0))
     target_hub_degree_threshold = params.get('target_hub_degree_threshold', 10000)
     target_hub_degree_threshold = (target_hub_degree_threshold if target_hub_degree_threshold and target_hub_degree_threshold > 0 else None)
@@ -473,7 +474,7 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
 
     def fact_can_survive_upper_bound(fact_kb1, quasi_score_map, obj_kb2_scores):
         """Check if a source fact can survive the upper bound score pruning considering the best object and predicate scores."""
-        if not evidence_upper_bound_enabled:
+        if not upper_bound_pruning_enabled:
             return True
         if not quasi_score_map or not obj_kb2_scores:
             return False
@@ -496,7 +497,7 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
             quasi_score_map,
             predicate_ids):
         """Filter target predicates based on functionality and score upper bounds."""
-        if not evidence_upper_bound_enabled:
+        if not upper_bound_pruning_enabled:
             return tuple(predicate_ids)
         if not hasattr(kb_dst, '_objects_for_subject_predicate_id_count'):
             return tuple(predicate_ids)
@@ -623,12 +624,12 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
             pred_score = quasi_scores[fact_kb1[alignment_base.PRED]][single_evi2[alignment_base.PRED]]
             score = min(obj_score, pred_score)
             max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
-            if evidence_upper_bound_enabled:
-                evidence_upper_bound = min(
+            if upper_bound_pruning_enabled:
+                upper_bound_score = min(
                     best_case_hmean_with_score(obj_score, max_rule_evidence),
                     best_case_hmean_with_score(pred_score, max_rule_evidence),
                 )
-                if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2_id, evidence_upper_bound):
+                if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2_id, upper_bound_score):
                     profile_stats['upper_bound_pruned_evidence'] += 1
                     continue
             add_entity_evidence_pair(context, subj2_id, single_evi2, fact_kb1, score)
@@ -930,7 +931,7 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
         for predicate, target_scores in positive_quasi_scores.items()
         if target_scores
     }
-    evidence_upper_bound_enabled = params.get('evidence_upper_bound', True)
+    upper_bound_pruning_enabled = not params.get('disable_upper_bound_pruning', False)
     minimum_output_score = max(0.0, float(params.get('prune_min_score', 0.0) or 0.0))
     target_hub_degree_threshold = params.get('target_hub_degree_threshold', 10000)
     target_hub_degree_threshold = (
@@ -1002,7 +1003,7 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
 
     def fact_can_survive_upper_bound(fact_kb1, quasi_score_map, obj_kb2_scores):
         """Check if a source fact can survive the upper bound score pruning considering the best object and predicate scores."""
-        if not evidence_upper_bound_enabled:
+        if not upper_bound_pruning_enabled:
             return True
         if not quasi_score_map or not obj_kb2_scores:
             return False
@@ -1026,7 +1027,7 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
     def filter_target_predicates_by_functionality_bound(fact_kb1, obj_kb2, obj_score, quasi_scores):
         """Filter target predicates based on functionality and score upper bounds."""
         predicates = tuple(quasi_scores)
-        if not evidence_upper_bound_enabled:
+        if not upper_bound_pruning_enabled:
             return predicates
 
         floor = max(minimum_output_score, max_ent_score(fact_kb1[alignment_base.OBJ]))
@@ -1136,12 +1137,12 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
             pred_score = positive_quasi_scores[fact_kb1[alignment_base.PRED]][single_evi2[alignment_base.PRED]]
             score = min(obj_score, pred_score)
             max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
-            if evidence_upper_bound_enabled:
-                evidence_upper_bound = min(
+            if upper_bound_pruning_enabled:
+                upper_bound_score = min(
                     best_case_hmean_with_score(obj_score, max_rule_evidence),
                     best_case_hmean_with_score(pred_score, max_rule_evidence),
                 )
-                if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2, evidence_upper_bound):
+                if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2, upper_bound_score):
                     profile_stats['upper_bound_pruned_evidence'] += 1
                     continue
             add_entity_evidence_pair(subj2_pairs, subj2, single_evi2, fact_kb1, score)
