@@ -25,7 +25,7 @@ This version keeps the original FLORA algorithmic structure and logic, but adds 
 
 ## Installation
 
-Clone this repository and set up the base environment via `requirements.txt`. FLORA supports Python >= 3.9 and < 3.12.
+Clone this repository and set up the base environment via `requirements.txt`. FLORA+ supports Python >= 3.9 and < 3.12.
 
 ```bash
 conda create -n flora python=3.10
@@ -42,7 +42,7 @@ conda install -c pytorch -c nvidia -c conda-forge "faiss-gpu>=1.9.0,<2.0"
 
 Use either `faiss-cpu` or `faiss-gpu`, not both.
 
-## Running FLORA
+## Running FLORA+
 Run the commands below from the `src/` directory:
 
 ```bash
@@ -64,14 +64,14 @@ The two toy KGs each contain one labeled Elvis entity and one `marriedTo` fact, 
 - `mini1.ttl`: `yago:Elvis rdfs:label "Elvis"` and `yago:Elvis yago:marriedTo yago:Priscilla`
 - `mini2.ttl`: `dbp:Elvis rdfs:label "Elvis"` and `dbp:Elvis dbp:marriedTo dbp:Priscilla`
 
-The toy example uses exact literal matching and does not require embedding precomputation. FLORA writes prefix declarations and scored literal, entity, and relation alignments to `../save/results/mini-test.ttl`.
+The toy example uses exact literal matching and does not require embedding precomputation. FLORA+ writes prefix declarations and scored literal, entity, and relation alignments to `../save/results/mini-test.ttl`.
 
 We also provide two mini-test datasets: [Person, Restaurant](https://oaei.ontologymatching.org/2010/im/index.html) from OAEI 2010 for quick test. 
 
 ### Custom Turtle Files
 
 **Pre-compute the string embeddings.**
-To initialize literal similarities, FLORA needs embeddings for all strings (excluding dates and numbers). Computing these embeddings separately lets you use a GPU for embedding generation, save the results, and then run the subsequent alignment steps on CPUs using the saved embeddings. This frees up GPU resources as soon as embedding generation finishes, instead of keeping them allocated throughout the alignment process.
+To initialize literal similarities, FLORA+ needs embeddings for all strings (excluding dates and numbers). Computing these embeddings separately lets you use a GPU for embedding generation, save the results, and then run the subsequent alignment steps on CPUs using the saved embeddings. This frees up GPU resources as soon as embedding generation finishes, instead of keeping them allocated throughout the alignment process.
 For example:
 ```bash
 python literal_embedding.py \
@@ -117,7 +117,7 @@ Logs are written to `../save/logs/`.
 ## Reproducing the Experiments
 
 **Dataset.**
-FLORA uses datasets from:
+FLORA+ uses datasets from:
 
 - [OpenEA](https://github.com/nju-websoft/OpenEA): `D_W_15K_V1`, `D_W_15K_V2`
 - [DBP15K](https://github.com/nju-websoft/JAPE): `fr_en`, `ja_en`, `zh_en`
@@ -125,7 +125,7 @@ FLORA uses datasets from:
 - [DBP1M](https://github.com/ZJU-DAILY/LargeEA):`de_en`, `fr_en`,
 - **DBpedia-YAGO**: a large-scale, real-world EA dataset based on English DBpedia and YAGO data constructed by ourselves.
 
-Due to memory limitations, all datasets and pretrained embeddings used in the paper are on the [drive](https://nextcloud.r2.enst.fr/nextcloud/index.php/s/xj3oStmzLcknicr?opendetails=). Download and unzip the files from the drive into the matching subdirectories under `FLORA/data/`.
+Due to memory limitations, all datasets and pretrained embeddings used in the paper are on the [drive](https://nextcloud.r2.enst.fr/nextcloud/index.php/s/xj3oStmzLcknicr?opendetails=). Download and unzip the files from the drive into the matching subdirectories under `../data/`.
 
 For detailed statistics on each dataset, please refer to `statistics.pdf`.
 
