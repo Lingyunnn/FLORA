@@ -9,17 +9,24 @@ cd "${SRC_DIR}"
 printf '==========Running FLORA==========\n'
 
 printf '==========Running Mini Test==========\n'
-python main.py --dataset small-test/mini/ --output mini-test.ttl --embedding emb/mini/ --alpha 3.0 --init 0.7
-python main.py --dataset small-test/restaurant/ --output small-test-restaurant.ttl --embedding emb/restaurant/ --alpha 3.0 --init 0.7
-python main.py --dataset small-test/person/ --output small-test-person.ttl --embedding emb/person/ --alpha 3.0 --init 0.7
+python main.py --dataset small-test/mini/ --output ../save/results/mini-test.ttl --embedding ../data/emb/mini/
+python main.py --dataset small-test/restaurant/ --output ../save/results/small-test-restaurant.ttl --embedding ../data/emb/restaurant/
+python main.py --dataset small-test/person/ --output ../save/results/small-test-person.ttl --embedding ../data/emb/person/
 
 printf '==========Running Entity Alignment==========\n'
-python main.py --dataset OpenEA/D_W_15K_V1/ --output dw-v1.ttl --embedding emb/D_W_15K_V1/ --alpha 3.0 --init 0.7
-python main.py --dataset OpenEA/D_W_15K_V2/ --output dw-v2.ttl --embedding emb/D_W_15K_V2/ --alpha 3.0 --init 0.7
-python main.py --dataset DBP15k/fr_en/ --output dbp-fr-en.ttl --embedding emb/fr_en/ --alpha 3.0 --init 0.7
-python main.py --dataset DBP15k/zh_en/ --output dbp-zh-en.ttl --embedding emb/zh_en/ --alpha 3.0 --init 0.7
-python main.py --dataset DBP15k/ja_en/ --output dbp-ja-en.ttl --embedding emb/ja_en/ --alpha 3.0 --init 0.7
+python main.py --dataset OpenEA/D_W_15K_V1/ --output ../save/results/dw-v1.ttl --embedding ../data/emb/D_W_15K_V1/
+python main.py --dataset OpenEA/D_W_15K_V2/ --output ../save/results/dw-v2.ttl --embedding ../data/emb/D_W_15K_V2/
+python main.py --dataset DBP15k/fr_en/ --output ../save/results/dbp15k-fr-en.ttl --embedding ../data/emb/fr_en/ --literal_idf
+python main.py --dataset DBP15k/zh_en/ --output ../save/results/dbp15k-zh-en.ttl --embedding ../data/emb/zh_en/ --literal_idf
+python main.py --dataset DBP15k/ja_en/ --output ../save/results/dbp15k-ja-en.ttl --embedding ../data/emb/ja_en/ --literal_idf
 
 printf '==========Running KG Alignment on OAEI datasets==========\n'
-python main.py --dataset OAEI/memoryalpha-stexpanded/ --output memoryalpha-stexpanded.ttl --embedding emb/memoryalpha-stexpanded/ --alpha 3.0 --init 0.7
-python main.py --dataset OAEI/starwars-swtor/ --output starwars-swtor.ttl --embedding emb/starwars-swtor/ --alpha 3.0 --init 0.7
+python main.py --dataset OAEI/memoryalpha-stexpanded/ --output ../save/results/memoryalpha-stexpanded.ttl --embedding ../data/emb/memoryalpha-stexpanded/ --disable_predicate_identity_init
+python main.py --dataset OAEI/starwars-swtor/ --output ../save/results/starwars-swtor.ttl --embedding ../data/emb/starwars-swtor/ --disable_predicate_identity_init
+
+printf '==========Running KG Alignment on DBP1M datasets==========\n'
+python main.py --kg1 ../data/DBP1M_with_name/de/kg1.ttl --kg2 ../data/DBP1M_with_name/de/kg2.ttl --embedding ../data/emb/DBP1M/de/ --output ../save/results/dbp1m_de_with_name.ttl --target_hub_degree_threshold 1000
+python main.py --kg1 ../data/DBP1M_with_name/fr/kg1.ttl --kg2 ../data/DBP1M_with_name/fr/kg2.ttl --embedding ../data/emb/DBP1M/fr/ --output ../save/results/dbp1m_fr_with_name.ttl --target_hub_degree_threshold 1000
+
+printf '==========Running KG Alignment on DBpedia_YAGO datasets==========\n'
+python main.py --kg1 ../data/dbpedia_yago/dbpedia_en.ttl --kg2 ../data/dbpedia_yago/yago_en.ttl --embedding ../data/emb/DBpedia_YAGO/ --output ../save/results/dbpedia_yago.ttl --literal_idf --literal_english_filter --literal_faiss_index hnsw --target_hub_degree_threshold 1000
