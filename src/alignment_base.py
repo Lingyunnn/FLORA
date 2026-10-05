@@ -49,25 +49,6 @@ def fast_hmean(values):
         count += 1
     return count / reciprocal_sum if count and reciprocal_sum else 0.0
 
-def encode_pattern(seq):
-    """
-    Encode a sequence by first-occurrence pattern.
-
-    Example:
-    ("a", "b", "a") -> (0, 1, 0)
-    ("x", "y", "x") -> (0, 1, 0)
-    """
-    value2code = {}
-    pattern = []
-    next_code = 0
-    for value in seq:
-        if value not in value2code:
-            value2code[value] = next_code
-            next_code += 1
-        pattern.append(value2code[value])
-    return tuple(pattern)
-
-
 #################################################################
 #                 Multiprocessing Queue Helpers                 #
 #################################################################
@@ -188,11 +169,38 @@ def drain_side_queue_items(side_queues):
         drained_counts[label] = drained_counts.get(label, 0) + drain_queue_items(queue_obj, handler)
     return drained_counts
 
+def stop_workers(tasks):
+    """Terminate any running workers and reap all child processes."""
+    for task in tasks:
+        if task.is_alive():
+            task.terminate()
+    for task in tasks:
+        task.join()
+
+def raise_if_worker_failed(tasks, stage_label=None):
+    """Stop a worker stage and raise when any child exits unsuccessfully."""
+    failed_workers = [
+        (task.pid, task.exitcode)
+        for task in tasks
+        if task.exitcode not in (None, 0)
+    ]
+    if not failed_workers:
+        return
+
+    stop_workers(tasks)
+    details = ", ".join(
+        "pid=%s exitcode=%s" % worker
+        for worker in failed_workers
+    )
+    raise RuntimeError(
+        "%s worker failed | %s"
+        % (stage_label or "Worker stage", details)
+    )
+
 def _put_task_with_drain(task_queue, item, result_queue=None, merge_fn=None,
                          wait_interval=RESULT_DRAIN_INTERVAL,
                          progress_logger=None, progress_fields=None,
-                         memory_tracker=None, side_queues=None,
-                         worker_tasks=None, stage_label=None):
+                         side_queues=None, worker_tasks=None, stage_label=None):
     """
     Try to enqueue one task without blocking indefinitely. If the task queue is
     full, drain worker results before retrying so the producer cannot deadlock
@@ -201,6 +209,8 @@ def _put_task_with_drain(task_queue, item, result_queue=None, merge_fn=None,
     drained_results = 0
     wait_loops = 0
     while True:
+        if worker_tasks is not None:
+            raise_if_worker_failed(worker_tasks, stage_label)
         try:
             task_queue.put_nowait(item)
             return drained_results, wait_loops
@@ -209,37 +219,21 @@ def _put_task_with_drain(task_queue, item, result_queue=None, merge_fn=None,
             if result_queue is not None and merge_fn is not None:
                 drained_results += drain_queue_items(result_queue, merge_fn)
             side_drained_counts = drain_side_queue_items(side_queues)
-            if worker_tasks is not None and not any(task.is_alive() for task in worker_tasks):
-                for task in worker_tasks:
-                    task.join(timeout=0)
-                exitcodes = [task.exitcode for task in worker_tasks]
-                logging.error(
-                    "%s task queue is full but no workers are alive | "
-                    "exitcodes=%s | pending_item_is_sentinel=%s | wait_loops=%s | "
-                    "drained_results=%s",
-                    stage_label or "Worker stage",
-                    exitcodes, item is None, wait_loops,
-                    drained_results,
-                )
-                raise RuntimeError(
-                    "%s task queue is full but no workers are alive; exitcodes=%s"
-                    % (stage_label or "Worker stage", exitcodes)
-                )
+            if worker_tasks is not None:
+                raise_if_worker_failed(worker_tasks, stage_label)
             if progress_logger is not None:
                 fields = dict(progress_fields or {})
                 fields['queue_wait_loops'] = wait_loops
                 fields['merged_result_chunks'] = fields.get('merged_result_chunks', 0) + drained_results
                 for label, count in side_drained_counts.items():
                     fields[f"drained_{label}"] = count
-                if memory_tracker is not None:
-                    fields.update(memory_tracker.progress_fields())
                 progress_logger(**fields)
             time.sleep(wait_interval)
 
 def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CHUNK_SIZE,
                        result_queue=None, merge_fn=None, include_literals=False,
                        stage_label=None, progress_interval=PROGRESS_LOG_INTERVAL,
-                       memory_tracker=None, side_queues=None, only_literals=False,
+                       side_queues=None, only_literals=False,
                        source_entities=None, worker_tasks=None):
     """
     Feed entity chunks lazily so only a bounded number of tasks reside in the
@@ -280,7 +274,6 @@ def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CH
                 'sentinels_sent': sentinels_sent,
                 'merged_result_chunks': merged_result_chunks,
             },
-            memory_tracker=memory_tracker,
             side_queues=side_queues,
             worker_tasks=worker_tasks,
             stage_label=stage_label,
@@ -288,8 +281,6 @@ def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CH
         merged_result_chunks += drained_results
         fed_chunks += 1
         fed_entities += len(entity_chunk)
-        if memory_tracker is not None:
-            memory_tracker.sample()
         if result_queue is not None and merge_fn is not None:
             merged_result_chunks += drain_queue_items(result_queue, merge_fn)
         side_drained_counts = drain_side_queue_items(side_queues)
@@ -303,8 +294,6 @@ def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CH
             }
             for label, count in side_drained_counts.items():
                 fields[f"drained_{label}"] = count
-            if memory_tracker is not None:
-                fields.update(memory_tracker.progress_fields())
             progress_logger(**fields)
     for _ in range(num_workers):
         drained_results, wait_loops = _put_task_with_drain(
@@ -319,15 +308,12 @@ def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CH
                 'sentinels_sent': sentinels_sent,
                 'merged_result_chunks': merged_result_chunks,
             },
-            memory_tracker=memory_tracker,
             side_queues=side_queues,
             worker_tasks=worker_tasks,
             stage_label=stage_label,
         )
         merged_result_chunks += drained_results
         sentinels_sent += 1
-        if memory_tracker is not None:
-            memory_tracker.sample()
         if result_queue is not None and merge_fn is not None:
             merged_result_chunks += drain_queue_items(result_queue, merge_fn)
         side_drained_counts = drain_side_queue_items(side_queues)
@@ -341,8 +327,6 @@ def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CH
             }
             for label, count in side_drained_counts.items():
                 fields[f"drained_{label}"] = count
-            if memory_tracker is not None:
-                fields.update(memory_tracker.progress_fields())
             progress_logger(**fields)
 
     return {
@@ -354,7 +338,7 @@ def feed_entity_chunks(task_queue, graph, num_workers, chunk_size=ENTITY_TASK_CH
 
 def wait_for_workers_and_drain(tasks, result_queue, merge_fn, poll_interval=RESULT_DRAIN_INTERVAL,
                                stage_label=None, progress_interval=PROGRESS_LOG_INTERVAL,
-                               memory_tracker=None, side_queues=None):
+                               side_queues=None):
     """
     Merge partial worker results while processes are still running so the
     result queue does not accumulate the full iteration output. Side queues are
@@ -367,8 +351,7 @@ def wait_for_workers_and_drain(tasks, result_queue, merge_fn, poll_interval=RESU
         alive_workers = sum(task.is_alive() for task in tasks)
         merged_result_chunks += drain_queue_items(result_queue, merge_fn)
         side_drained_counts = drain_side_queue_items(side_queues)
-        if memory_tracker is not None:
-            memory_tracker.sample()
+        raise_if_worker_failed(tasks, stage_label)
         if alive_workers == 0:
             break
         if progress_logger is not None:
@@ -379,20 +362,13 @@ def wait_for_workers_and_drain(tasks, result_queue, merge_fn, poll_interval=RESU
             }
             for label, count in side_drained_counts.items():
                 fields[f"drained_{label}"] = count
-            if memory_tracker is not None:
-                fields.update(memory_tracker.progress_fields())
             progress_logger(**fields)
         time.sleep(poll_interval)
     for task in tasks:
         task.join()
     merged_result_chunks += drain_queue_items(result_queue, merge_fn)
     drain_side_queue_items(side_queues)
-    if memory_tracker is not None:
-        memory_tracker.log_peak(stage_label or "Worker stage")
-
-    nonzero_exitcodes = [task.exitcode for task in tasks if task.exitcode not in (None, 0)]
-    if nonzero_exitcodes:
-        logging.warning("%s worker exitcodes | exitcodes=%s", stage_label or "Worker stage", nonzero_exitcodes)
+    raise_if_worker_failed(tasks, stage_label)
 
     return {'merged_result_chunks': merged_result_chunks, 'worker_count': len(tasks)}
 
@@ -1213,7 +1189,7 @@ def build_compact_entity_assign_index(kb_src, kb_dst, ent_max_assign, mmap_dir):
         'dst_entity_count': dst_entity_count,
         'array_bytes': array_bytes,
     }
-    logging.info(
+    logging.debug(
         "Compact entity assignment array index built | pairs=%s | src_entities=%s | "
         "dst_entities=%s | array_bytes=%.2fMB | dir=%s",
         pair_count, src_entity_count,

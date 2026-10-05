@@ -9,12 +9,16 @@ from queue import Full
 import gc
 import logging
 import os
+import threading
 import time
 import traceback
 import side_keys
 
 
 DEFAULT_PROGRESS_LOG_INTERVAL = 300.0
+# PSS collection walks every process's memory map and can take several seconds
+# for large forked workers. Keep it off hot paths and sample at a low frequency.
+MEMORY_SAMPLE_INTERVAL = 30.0
 
 
 def current_pss_mb():
@@ -68,46 +72,103 @@ def process_tree_memory_snapshot(worker_pids=None, parent_pid=None):
 
 
 class ProcessMemoryPeakTracker(object):
-    """Track parent + worker PSS peak during a worker stage."""
+    """Track parent + worker PSS peak asynchronously during a worker stage."""
 
-    def __init__(self, stage_label, worker_pids=None, sample_interval=DEFAULT_PROGRESS_LOG_INTERVAL):
+    def __init__(self, stage_label, worker_pids=None, sample_interval=MEMORY_SAMPLE_INTERVAL):
         self.stage_label = stage_label
         self.worker_pids = list(worker_pids or [])
         self.sample_interval = sample_interval
         self.last_sample_time = 0.0
         self.current = None
         self.peak = None
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._state_lock = threading.Lock()
+        self._sample_lock = threading.Lock()
 
     def set_worker_pids(self, worker_pids):
-        self.worker_pids = list(worker_pids or [])
-        self.sample(force=True)
+        with self._state_lock:
+            self.worker_pids = list(worker_pids or [])
 
     def sample(self, force=False):
-        now = time.monotonic()
-        if not force and self.current is not None and now - self.last_sample_time < self.sample_interval:
-            return self.current
-        snapshot = process_tree_memory_snapshot(self.worker_pids)
-        self.current = snapshot
-        self.last_sample_time = now
-        if self.peak is None or snapshot['total_pss_mb'] > self.peak['total_pss_mb']:
-            self.peak = dict(snapshot)
-        return snapshot
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return None
+        # Serializing samples prevents a status log from starting a second
+        # expensive /proc scan while the background sampler is still running.
+        with self._sample_lock:
+            now = time.monotonic()
+            with self._state_lock:
+                if not force and self.current is not None and now - self.last_sample_time < self.sample_interval:
+                    return self.current
+                worker_pids = list(self.worker_pids)
+            snapshot = process_tree_memory_snapshot(worker_pids)
+            with self._state_lock:
+                self.current = snapshot
+                # Measure the interval from completion, not from the beginning
+                # of a potentially slow smaps_rollup scan.
+                self.last_sample_time = time.monotonic()
+                if self.peak is None or snapshot['total_pss_mb'] > self.peak['total_pss_mb']:
+                    self.peak = dict(snapshot)
+            return snapshot
+
+    def _sample_loop(self):
+        # Always take at least one sample, including for very short stages.
+        while True:
+            self.sample(force=True)
+            if self._stop_event.wait(self.sample_interval):
+                break
+
+    def start(self):
+        """Start low-frequency sampling in a daemon thread and return immediately."""
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return self
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._sample_loop,
+            name="flora-pss-%s" % self.stage_label,
+            daemon=True,
+        )
+        self._thread.start()
+        logging.debug(
+            "%s memory monitor started | mode=async-pss | interval_seconds=%.3f | workers=%s",
+            self.stage_label, self.sample_interval, len(self.worker_pids),
+        )
+        return self
+
+    def stop(self):
+        """Stop background sampling, waiting only for an in-progress scan."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        return self
 
     def progress_fields(self):
-        current = self.sample()
+        # Reporting progress must never trigger a synchronous PSS scan.
+        with self._state_lock:
+            current = None if self.current is None else dict(self.current)
+            peak = None if self.peak is None else dict(self.peak)
+        if current is None:
+            return {
+                'total_pss_mb': 'unavailable',
+                'worker_pss_mb': 'unavailable',
+            }
         fields = {
             'total_pss_mb': f"{current['total_pss_mb']:.2f}",
             'worker_pss_mb': f"{current['worker_pss_mb']:.2f}",
         }
-        if self.peak is not None:
-            fields['peak_total_pss_mb'] = f"{self.peak['total_pss_mb']:.2f}"
+        if peak is not None:
+            fields['peak_total_pss_mb'] = f"{peak['total_pss_mb']:.2f}"
         return fields
 
     def log_current(self, label=None):
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return
         snapshot = self.sample(force=True)
         parent_pss = snapshot['parent_pss_mb']
         parent_pss_text = "unavailable" if parent_pss is None else f"{parent_pss:.2f}"
-        logging.info(
+        logging.debug(
             "%s memory snapshot | total_pss_mb=%.2f | parent_pss_mb=%s | "
             "worker_pss_mb=%.2f | alive_workers=%s | missing_workers=%s | worker_pids=%s",
             label or self.stage_label,
@@ -120,14 +181,21 @@ class ProcessMemoryPeakTracker(object):
         )
 
     def log_peak(self, label=None):
-        self.sample(force=True)
-        snapshot = self.peak or self.current
+        self.stop()
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return
+        if self._thread is None:
+            # Preserve the old one-shot behavior for callers that did not start
+            # background monitoring explicitly.
+            self.sample(force=True)
+        with self._state_lock:
+            snapshot = None if (self.peak or self.current) is None else dict(self.peak or self.current)
         if snapshot is None:
-            logging.info("%s memory peak | unavailable", label or self.stage_label)
+            logging.debug("%s memory peak | unavailable", label or self.stage_label)
             return
         parent_pss = snapshot['parent_pss_mb']
         parent_pss_text = "unavailable" if parent_pss is None else f"{parent_pss:.2f}"
-        logging.info(
+        logging.debug(
             "%s memory peak | total_pss_mb=%.2f | parent_pss_mb=%s | "
             "worker_pss_mb=%.2f | alive_workers=%s | missing_workers=%s | worker_pids=%s",
             label or self.stage_label,
@@ -138,6 +206,50 @@ class ProcessMemoryPeakTracker(object):
             len(snapshot['missing_worker_pids']),
             snapshot['worker_pids'],
         )
+
+
+class StageMemoryPeakTracker(object):
+    """Track current-process PSS peak while a synchronous preprocessing stage runs."""
+
+    def __init__(self, stage_label, sample_interval=MEMORY_SAMPLE_INTERVAL):
+        self.stage_label = stage_label
+        self.sample_interval = sample_interval
+        self.peak_pss_mb = None
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _sample_loop(self):
+        while not self._stop_event.is_set():
+            self.sample()
+            self._stop_event.wait(self.sample_interval)
+
+    def sample(self):
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return None
+        pss_mb = current_pss_mb()
+        if pss_mb is not None and (self.peak_pss_mb is None or pss_mb > self.peak_pss_mb):
+            self.peak_pss_mb = pss_mb
+        return pss_mb
+
+    def start(self):
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return self
+        self.sample()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def log_peak(self, label=None):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return
+        self.sample()
+        if self.peak_pss_mb is None:
+            logging.debug("%s | peak_pss_mb=unavailable | pid=%s", label or self.stage_label, os.getpid())
+            return
+        logging.debug("%s | peak_pss_mb=%.2f | pid=%s", label or self.stage_label, self.peak_pss_mb, os.getpid())
 
 
 def prepare_for_worker_fork(stage_label=None):
@@ -151,11 +263,13 @@ def prepare_for_worker_fork(stage_label=None):
 
 
 def log_memory_snapshot(stage_label):
+    if not logging.getLogger().isEnabledFor(logging.DEBUG):
+        return
     pss_mb = current_pss_mb()
     if pss_mb is None:
-        logging.info("%s | pss_mb=unavailable | pid=%s", stage_label, os.getpid())
+        logging.debug("%s | pss_mb=unavailable | pid=%s", stage_label, os.getpid())
         return
-    logging.info("%s | pss_mb=%.2f | pid=%s", stage_label, pss_mb, os.getpid())
+    logging.debug("%s | pss_mb=%.2f | pid=%s", stage_label, pss_mb, os.getpid())
 
 
 def log_worker_profiles(worker_profiles):
@@ -235,7 +349,7 @@ def log_worker_profiles(worker_profiles):
         total_select,
         total_align,
     )
-    logging.info(
+    logging.debug(
         "Worker expansion profile | candidate_obj2=%s | scanned_evi2=%s | "
         "max_scanned_evi2_entity=%s | max_context_pairs_entity=%s | "
         "max_align_time_entity_s=%.3fs | "
@@ -309,8 +423,10 @@ def nested_mapping_stats(mapping):
 
 
 def log_nested_mapping_stats(stage_label, mapping):
+    if not logging.getLogger().isEnabledFor(logging.INFO):
+        return
     stats = nested_mapping_stats(mapping)
-    logging.info(
+    logging.debug(
         "%s | sources=%s | non_empty=%s | pairs=%s | max_targets_per_source=%s",
         stage_label,
         stats['sources'],
@@ -331,6 +447,8 @@ def _short_entity_term(term, kb1=None, kb2=None, max_length=180):
 
 def log_alignment_fanout(stage_label, mapping, kb1=None, kb2=None, top_n=10, min_targets=50, target_sample=8):
     """Log high fan-out sources in nested alignment mappings."""
+    if not logging.getLogger().isEnabledFor(logging.DEBUG):
+        return
     thresholds = (10, 20, 50, 100, 500, 1000)
     threshold_counts = {threshold: 0 for threshold in thresholds}
     top_items = []
@@ -345,7 +463,7 @@ def log_alignment_fanout(stage_label, mapping, kb1=None, kb2=None, top_n=10, min
         if target_count >= min_targets:
             top_items.append((target_count, max(target_scores.values()), entity, target_scores))
 
-    logging.info(
+    logging.debug(
         "%s fanout summary | >=10=%s | >=20=%s | >=50=%s | >=100=%s | "
         ">=500=%s | >=1000=%s | detail_min_targets=%s",
         stage_label,
@@ -370,7 +488,7 @@ def log_alignment_fanout(stage_label, mapping, kb1=None, kb2=None, top_n=10, min
             )
             for target, score in sample_items
         ]
-        logging.info(
+        logging.debug(
             "%s fanout detail | rank=%s | entity=%s | side=%s | targets=%s | "
             "min_score=%.6g | max_score=%.6g | distinct_scores=%s | "
             "max_score_targets=%s | target_sample=%s",
@@ -402,8 +520,10 @@ def predicate_mapping_stats(predicate_mapping):
 
 
 def log_predicate_mapping_stats(stage_label, predicate_mapping):
+    if not logging.getLogger().isEnabledFor(logging.DEBUG):
+        return
     stats = predicate_mapping_stats(predicate_mapping)
-    logging.info(
+    logging.debug(
         "%s | predicates=%s | relation_pairs=%s | max_matches_per_predicate=%s",
         stage_label,
         stats['predicates'],

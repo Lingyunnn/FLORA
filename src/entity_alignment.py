@@ -218,6 +218,7 @@ def bootstrap_algo(kb_src, kb_dst, sameAsScore, pred2superPred, functionalities,
     ent_queue_ = None
     ent_match_tuple_queue_ = None
     bootstrap_assign_mmap_dir = None
+    memory_tracker = None
     try:
         log.prepare_for_worker_fork(stage_name)
         num_workers = max(1, num_workers or mp.cpu_count())
@@ -259,10 +260,10 @@ def bootstrap_algo(kb_src, kb_dst, sameAsScore, pred2superPred, functionalities,
             else:
                 alignment_base.merge_same_as_score_chunk(sameAsScore, ent_match_score_dict, min_score=min_score)
         
-        logging.info("%s worker implementation | mode=%s", stage_name, "compact-id" if worker_target is _1st_iteration_compact else "string")
+        logging.debug("%s worker implementation | mode=%s", stage_name, "compact-id" if worker_target is _1st_iteration_compact else "string")
         logging.info("%s active source candidates | sources=%s", stage_name, len(ent_max_assign))
         if compact_assign_metadata is not None:
-            logging.info(
+            logging.debug(
                 "%s compact source-target assignments | pairs=%s | array_bytes=%.2fMB",
                 stage_name,
                 compact_assign_metadata['pair_count'],
@@ -284,8 +285,10 @@ def bootstrap_algo(kb_src, kb_dst, sameAsScore, pred2superPred, functionalities,
             task = mp.Process(target=worker_target, args=args)
             task.start()
             tasks.append(task)
-        memory_tracker = log.ProcessMemoryPeakTracker(stage_name, [task.pid for task in tasks])
-        memory_tracker.log_current(f"{stage_name} memory start")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            memory_tracker = log.ProcessMemoryPeakTracker(stage_name, [task.pid for task in tasks])
+            memory_tracker.log_current(f"{stage_name} memory start")
+            memory_tracker.start()
         alignment_base.feed_entity_chunks(
             ent_queue_,
             kb_src,
@@ -294,7 +297,6 @@ def bootstrap_algo(kb_src, kb_dst, sameAsScore, pred2superPred, functionalities,
             merge_fn=merge_chunk,
             include_literals=True,
             stage_label=stage_name,
-            memory_tracker=memory_tracker,
             only_literals=True,
             source_entities=ent_max_assign.keys(),
             worker_tasks=tasks,
@@ -304,9 +306,12 @@ def bootstrap_algo(kb_src, kb_dst, sameAsScore, pred2superPred, functionalities,
             ent_match_tuple_queue_,
             merge_chunk,
             stage_label=stage_name,
-            memory_tracker=memory_tracker,
         )
+        if memory_tracker is not None:
+            memory_tracker.log_peak()
     finally:
+        if memory_tracker is not None:
+            memory_tracker.stop()
         if ent_queue_ is not None:
             ent_queue_.close()
             ent_queue_.join_thread()
@@ -320,6 +325,19 @@ def bootstrap_algo(kb_src, kb_dst, sameAsScore, pred2superPred, functionalities,
 #################################################################
 #                    Entity Matching Workers                    #
 #################################################################
+
+def _have_same_repetition_pattern(values1, values2):
+    """Return whether both sequences repeat values at the same positions."""
+    def canonical_pattern(values):
+        value_codes = {}
+        pattern = []
+        for value in values:
+            if value not in value_codes:
+                value_codes[value] = len(value_codes)
+            pattern.append(value_codes[value])
+        return pattern
+    return canonical_pattern(values1) == canonical_pattern(values2)
+
 
 def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
                                      ent_match_tuple_queue, ent_max_assign,
@@ -388,10 +406,6 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
         kb_dst,
         quasiEqvirel,
     )
-    quasi_predicate_sets = {
-        predicate_id: frozenset(predicate_ids)
-        for predicate_id, predicate_ids in quasi_predicates.items()
-    }
     # predicate functionalities
     (   src_functionalities,
         src_group_functionalities,
@@ -402,7 +416,6 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
         kb_dst,
         functionalities,
     )
-    upper_bound_pruning_enabled = not params.get('disable_upper_bound_pruning', False)
     minimum_output_score = max(0.0, float(params.get('prune_min_score', 0.0) or 0.0))
     target_hub_degree_threshold = params.get('target_hub_degree_threshold', 10000)
     target_hub_degree_threshold = (target_hub_degree_threshold if target_hub_degree_threshold and target_hub_degree_threshold > 0 else None)
@@ -474,8 +487,6 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
 
     def fact_can_survive_upper_bound(fact_kb1, quasi_score_map, obj_kb2_scores):
         """Check if a source fact can survive the upper bound score pruning considering the best object and predicate scores."""
-        if not upper_bound_pruning_enabled:
-            return True
         if not quasi_score_map or not obj_kb2_scores:
             return False
 
@@ -490,38 +501,63 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
         )
         return fact_upper_bound > max(minimum_output_score, max_ent_score_src(fact_kb1[alignment_base.OBJ]))
 
-    def filter_target_predicates_by_functionality_bound(
-            fact_kb1,
-            obj_kb2_id,
-            obj_score,
-            quasi_score_map,
-            predicate_ids):
-        """Filter target predicates based on functionality and score upper bounds."""
-        if not upper_bound_pruning_enabled:
-            return tuple(predicate_ids)
-        if not hasattr(kb_dst, '_objects_for_subject_predicate_id_count'):
-            return tuple(predicate_ids)
-
+    def build_predicate_bound_filter(fact_kb1, quasi_score_map, predicate_ids):
+        """Precompute predicate-side score bounds for a source fact."""
         floor = max(minimum_output_score, max_ent_score_src(fact_kb1[alignment_base.OBJ]))
         max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
+        always_pruned = 0
+        surviving_predicates = []
+        for predicate_id in predicate_ids:
+            pred_bound = best_case_hmean_with_score(
+                quasi_score_map[predicate_id],
+                max_rule_evidence,
+            )
+            if pred_bound <= floor:
+                always_pruned += 1
+            else:
+                surviving_predicates.append(predicate_id)
+        return floor, max_rule_evidence, always_pruned, tuple(surviving_predicates)
+
+    def filter_target_predicates_by_functionality_bound(fact_kb1, obj_kb2_id, obj_score,
+            quasi_score_map, predicate_ids, predicate_bound_filter=None):
+        """Filter target predicates based on functionality and score upper bounds."""
+        predicates = tuple(predicate_ids)
+        hub_pruning_enabled = target_hub_degree_threshold is not None
+        # Skip predicates that cannot survive the upper bound score pruning
+        if predicate_bound_filter is None: # precompute the predicate-side score bounds for this source fact
+            predicate_bound_filter = build_predicate_bound_filter(fact_kb1, quasi_score_map, predicates)
+        floor, max_rule_evidence, score_pruned_predicates, predicates = predicate_bound_filter
         obj_bound = best_case_hmean_with_score(obj_score, max_rule_evidence)
+        if obj_bound <= floor:
+            profile_stats['target_score_upper_bound_pruned_predicates'] += (
+                score_pruned_predicates + len(predicates)
+            )
+            profile_stats['target_score_upper_bound_pruned_candidates'] += 1
+            return ()
+        if not predicates:
+            if score_pruned_predicates:
+                profile_stats['target_score_upper_bound_pruned_predicates'] += score_pruned_predicates
+                profile_stats['target_score_upper_bound_pruned_candidates'] += 1
+            return ()
+
+        # Hub pruning is the only reason to query per subject-predicate counts;
+        # nonexistent predicates naturally yield no evidence during scanning.
+        if not hub_pruning_enabled:
+            if score_pruned_predicates:
+                profile_stats['target_score_upper_bound_pruned_predicates'] += score_pruned_predicates
+            return predicates
+        if not hasattr(kb_dst, '_objects_for_subject_predicate_id_count'):
+            return predicates
+
         kept_predicates = []
-        score_pruned_predicates = 0
         hub_pruned_predicates = 0
 
-        for predicate_id in predicate_ids:
+        for predicate_id in predicates:
             object_count = kb_dst._objects_for_subject_predicate_id_count(obj_kb2_id, predicate_id)
             if object_count <= 0:
                 continue
 
-            pred_score = quasi_score_map[predicate_id]
-            pred_bound = best_case_hmean_with_score(pred_score, max_rule_evidence)
-            score_upper_bound = min(obj_bound, pred_bound)
-            if score_upper_bound <= floor:
-                score_pruned_predicates += 1
-                continue
-
-            if (target_hub_degree_threshold is not None and object_count >= target_hub_degree_threshold):
+            if hub_pruning_enabled and object_count >= target_hub_degree_threshold:
                 hub_pruned_predicates += 1
                 continue
 
@@ -567,12 +603,20 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
             fact_kb1,
             quasi_score_map,
             quasi_predicate_ids,
-            quasi_predicate_id_set,
             obj_kb2_scores):
-        """Collect target entity candidates and their evidence for a given source fact."""
+        """ Collect target entity candidates and their evidence for a given source fact.
+            Parameters:
+                context: The alignment context, including entity memory profile and evidence pair mappings.
+                fact_kb1: The source fact.
+                quasi_score_map: A map of quasi-scores for predicates.
+                quasi_predicate_ids: A list of quasi-predicate IDs.
+                obj_kb2_scores: A list of target object scores.
+        """
         entity_memory_profile = context['entity_memory_profile']
         tmp_subj2_evi2 = {}
         subj2_maxsubrel_score = {}
+        all_quasi_predicate_set = frozenset(quasi_predicate_ids)
+        predicate_bound_filter = build_predicate_bound_filter(fact_kb1, quasi_score_map, quasi_predicate_ids)
         for obj_kb2_id, _obj_score in sorted(
             obj_kb2_scores,
             key=lambda item: (-item[1], item[0]),
@@ -588,13 +632,13 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
                 _obj_score,
                 quasi_score_map,
                 quasi_predicate_ids,
+                predicate_bound_filter,
             )
             if not filtered_predicate_ids:
                 continue
             evidence_iter = iter_dst_evidence(
                 obj_kb2_id,
-                quasi_predicate_id_set
-                if len(filtered_predicate_ids) == len(quasi_predicate_ids)
+                all_quasi_predicate_set if len(filtered_predicate_ids) == len(quasi_predicate_ids)
                 else frozenset(filtered_predicate_ids),
             )
             for evi2_ in evidence_iter:
@@ -624,14 +668,13 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
             pred_score = quasi_scores[fact_kb1[alignment_base.PRED]][single_evi2[alignment_base.PRED]]
             score = min(obj_score, pred_score)
             max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
-            if upper_bound_pruning_enabled:
-                upper_bound_score = min(
-                    best_case_hmean_with_score(obj_score, max_rule_evidence),
-                    best_case_hmean_with_score(pred_score, max_rule_evidence),
-                )
-                if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2_id, upper_bound_score):
-                    profile_stats['upper_bound_pruned_evidence'] += 1
-                    continue
+            upper_bound_score = min(
+                best_case_hmean_with_score(obj_score, max_rule_evidence),
+                best_case_hmean_with_score(pred_score, max_rule_evidence),
+            )
+            if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2_id, upper_bound_score):
+                profile_stats['upper_bound_pruned_evidence'] += 1
+                continue
             add_entity_evidence_pair(context, subj2_id, single_evi2, fact_kb1, score)
 
     def context_pair_count(context):
@@ -685,7 +728,7 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
                 obj2_combo, pred2_combo, subj2_combo = zip(*ev2)
                 assert len(set(subj1_combo)) == 1
                 assert len(set(subj2_combo)) == 1
-                if alignment_base.encode_pattern(obj1_combo) != alignment_base.encode_pattern(obj2_combo):
+                if not _have_same_repetition_pattern(obj1_combo, obj2_combo):
                     continue
                 localfunc1 = kb_src.localFunctionalityIds(obj1_combo, pred1_combo)
                 localfunc2 = kb_dst.localFunctionalityIds(obj2_combo, pred2_combo)
@@ -816,7 +859,6 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
                 quasi_score_map = quasi_scores.get(pred_kb1)
                 if quasi_score_map:
                     quasi_predicate_ids = quasi_predicates[pred_kb1]
-                    quasi_predicate_id_set = quasi_predicate_sets[pred_kb1]
                     obj_kb2_scores = tuple(active_target_scores(obj_kb1))
                     if obj_kb2_scores:
                         if not fact_can_survive_upper_bound(
@@ -831,7 +873,6 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
                             fact_kb1,
                             quasi_score_map,
                             quasi_predicate_ids,
-                            quasi_predicate_id_set,
                             obj_kb2_scores,
                         )
             collect_time = time.perf_counter() - stage_start
@@ -843,7 +884,6 @@ def _match_entities_by_rules_compact(kb_src, kb_dst, quasiEqvirel, queue,
             finish_context(context)
             del context
 
-    flush_compact_match_scores()
     flush_compact_match_scores()
     if profile_queue is not None:
         profile_queue.put(profile_stats)
@@ -931,7 +971,6 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
         for predicate, target_scores in positive_quasi_scores.items()
         if target_scores
     }
-    upper_bound_pruning_enabled = not params.get('disable_upper_bound_pruning', False)
     minimum_output_score = max(0.0, float(params.get('prune_min_score', 0.0) or 0.0))
     target_hub_degree_threshold = params.get('target_hub_degree_threshold', 10000)
     target_hub_degree_threshold = (
@@ -1003,8 +1042,6 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
 
     def fact_can_survive_upper_bound(fact_kb1, quasi_score_map, obj_kb2_scores):
         """Check if a source fact can survive the upper bound score pruning considering the best object and predicate scores."""
-        if not upper_bound_pruning_enabled:
-            return True
         if not quasi_score_map or not obj_kb2_scores:
             return False
 
@@ -1019,22 +1056,58 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
         )
         return fact_upper_bound > max(minimum_output_score, max_ent_score(fact_kb1[alignment_base.OBJ]))
 
+    def build_predicate_bound_filter(fact_kb1, quasi_scores):
+        """Precompute predicate-side score bounds once for a source fact."""
+        floor = max(minimum_output_score, max_ent_score(fact_kb1[alignment_base.OBJ]))
+        max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
+        always_pruned = 0
+        surviving_predicates = []
+        for predicate, pred_score in quasi_scores.items():
+            pred_bound = best_case_hmean_with_score(pred_score, max_rule_evidence)
+            if pred_bound <= floor:
+                always_pruned += 1
+            else:
+                surviving_predicates.append(predicate)
+        return floor, max_rule_evidence, always_pruned, tuple(surviving_predicates)
+
     def target_predicate_object_count(subject, predicate):
         """Get the number of objects for a given subject and predicate in the target knowledge base."""
         objects = kb_dst._objects_for_subject_predicate(subject, predicate)
         return len(objects) if objects else 0
 
-    def filter_target_predicates_by_functionality_bound(fact_kb1, obj_kb2, obj_score, quasi_scores):
+    def filter_target_predicates_by_functionality_bound(
+            fact_kb1,
+            obj_kb2,
+            obj_score,
+            quasi_scores,
+            predicate_bound_filter=None):
         """Filter target predicates based on functionality and score upper bounds."""
         predicates = tuple(quasi_scores)
-        if not upper_bound_pruning_enabled:
+        hub_pruning_enabled = target_hub_degree_threshold is not None
+        if predicate_bound_filter is None:
+            predicate_bound_filter = build_predicate_bound_filter(fact_kb1, quasi_scores)
+        floor, max_rule_evidence, score_pruned_predicates, predicates = predicate_bound_filter
+        obj_bound = best_case_hmean_with_score(obj_score, max_rule_evidence)
+        if obj_bound <= floor:
+            profile_stats['target_score_upper_bound_pruned_predicates'] += (
+                score_pruned_predicates + len(predicates)
+            )
+            profile_stats['target_score_upper_bound_pruned_candidates'] += 1
+            return ()
+        if not predicates:
+            if score_pruned_predicates:
+                profile_stats['target_score_upper_bound_pruned_predicates'] += score_pruned_predicates
+                profile_stats['target_score_upper_bound_pruned_candidates'] += 1
+            return ()
+
+        # Hub pruning is the only reason to query per subject-predicate counts;
+        # nonexistent predicates naturally yield no evidence during scanning.
+        if not hub_pruning_enabled:
+            if score_pruned_predicates:
+                profile_stats['target_score_upper_bound_pruned_predicates'] += score_pruned_predicates
             return predicates
 
-        floor = max(minimum_output_score, max_ent_score(fact_kb1[alignment_base.OBJ]))
-        max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
-        obj_bound = best_case_hmean_with_score(obj_score, max_rule_evidence)
         kept_predicates = []
-        score_pruned_predicates = 0
         hub_pruned_predicates = 0
 
         for predicate in predicates:
@@ -1042,17 +1115,7 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
             if object_count <= 0:
                 continue
 
-            pred_score = quasi_scores[predicate]
-            pred_bound = best_case_hmean_with_score(pred_score, max_rule_evidence)
-            score_upper_bound = min(obj_bound, pred_bound)
-            if score_upper_bound <= floor:
-                score_pruned_predicates += 1
-                continue
-
-            if (
-                target_hub_degree_threshold is not None
-                and object_count >= target_hub_degree_threshold
-            ):
+            if hub_pruning_enabled and object_count >= target_hub_degree_threshold:
                 hub_pruned_predicates += 1
                 continue
 
@@ -1085,9 +1148,16 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
             quasi_score_map,
             obj_kb2_scores,
             entity_memory_profile):
-        """Collect target entity candidates and their evidence for a given source fact."""
+        """Collect target entity candidates and their evidence for a given source fact.
+        Parameters:
+            subj2_pairs: A dictionary mapping target entities to their evidence pairs.
+            fact_kb1: The source fact.
+            quasi_score_map: A map of quasi-scores for predicates.
+            obj_kb2_scores: A list of target object scores.
+            entity_memory_profile: A dictionary to track memory usage statistics for the current entity."""
         tmp_subj2_evi2 = {}
         subj2_maxsubrel_score = {}
+        predicate_bound_filter = build_predicate_bound_filter(fact_kb1, quasi_score_map)
 
         for obj_kb2, obj_score in sorted(
             obj_kb2_scores,
@@ -1097,12 +1167,7 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
             if not kb_dst.has_subject(obj_kb2):
                 continue
 
-            filtered_quasi_predicates = filter_target_predicates_by_functionality_bound(
-                fact_kb1,
-                obj_kb2,
-                obj_score,
-                quasi_score_map,
-            )
+            filtered_quasi_predicates = filter_target_predicates_by_functionality_bound(fact_kb1, obj_kb2, obj_score, quasi_score_map, predicate_bound_filter)
             if not filtered_quasi_predicates:
                 continue
 
@@ -1137,14 +1202,13 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
             pred_score = positive_quasi_scores[fact_kb1[alignment_base.PRED]][single_evi2[alignment_base.PRED]]
             score = min(obj_score, pred_score)
             max_rule_evidence = min(20, max(1, params.get('gramN', 20)))
-            if upper_bound_pruning_enabled:
-                upper_bound_score = min(
-                    best_case_hmean_with_score(obj_score, max_rule_evidence),
-                    best_case_hmean_with_score(pred_score, max_rule_evidence),
-                )
-                if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2, upper_bound_score):
-                    profile_stats['upper_bound_pruned_evidence'] += 1
-                    continue
+            upper_bound_score = min(
+                best_case_hmean_with_score(obj_score, max_rule_evidence),
+                best_case_hmean_with_score(pred_score, max_rule_evidence),
+            )
+            if not rule_can_survive(fact_kb1[alignment_base.OBJ], subj2, upper_bound_score):
+                profile_stats['upper_bound_pruned_evidence'] += 1
+                continue
             add_entity_evidence_pair(subj2_pairs, subj2, single_evi2, fact_kb1, score)
 
     while True:
@@ -1275,7 +1339,7 @@ def _match_entities_by_rules(kb_src, kb_dst, quasiEqvirel, queue, ent_match_tupl
                     assert len(set(subj1_combo)) == 1
                     assert len(set(subj2_combo)) == 1
                     # check same pattern
-                    if alignment_base.encode_pattern(obj1_combo) != alignment_base.encode_pattern(obj2_combo):
+                    if not _have_same_repetition_pattern(obj1_combo, obj2_combo):
                         continue
                     localfunc1 = kb_src.localFunctionality(obj1_combo, pred1_combo)
                     localfunc2 = kb_dst.localFunctionality(obj2_combo, pred2_combo)

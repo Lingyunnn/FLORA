@@ -11,6 +11,7 @@ import os
 import pickle
 import argparse
 import gc
+import unicodedata
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -36,6 +37,66 @@ Str_tokenizer = None
 # Str_tokenizer = AutoTokenizer.from_pretrained('Lihuchen/pearl_small')
 # Str_model = AutoModel.from_pretrained('Lihuchen/pearl_small')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def _is_latin_text(text):
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return False
+    latin_letters = 0
+    for char in letters:
+        try:
+            if "LATIN" in unicodedata.name(char):
+                latin_letters += 1
+        except ValueError:
+            pass
+    return latin_letters / len(letters) >= 0.8
+
+
+def _normalize_for_embedding(text):
+    """Normalize text for embedding."""
+    return unicodedata.normalize("NFKC", text)
+
+COMMON_NAME_PUNCTUATION = set(" .,'’`-_/&+:()[]")
+
+def _has_suspicious_unicode(text, embedding_model=None):
+    """Reject strings with suspicious Unicode characters that embedding models often collapse."""
+    strict_latin = (embedding_model or DEFAULT_EMBEDDING_MODEL) == "Lihuchen/pearl_small"
+    for char in text:
+        if char in COMMON_NAME_PUNCTUATION:
+            continue
+
+        codepoint = ord(char)
+        category = unicodedata.category(char)
+        if category[0] in {"C", "S"}:  # Control or Symbol
+            return True
+        try:
+            char_name = unicodedata.name(char)
+        except ValueError:
+            char_name = ""
+        if any(token in char_name for token in ("REVERSED", "TURNED", "INVERTED", "SIDEWAYS")):
+            return True
+        if 0x02B0 <= codepoint <= 0x02FF:  # Spacing Modifier Letters
+            return True
+        if 0xA700 <= codepoint <= 0xA71F:  # Modifier tone letters
+            return True
+        if strict_latin and 0x0250 <= codepoint <= 0x02AF:  # IPA Extensions
+            return True
+        if strict_latin and 0x1D00 <= codepoint <= 0x1DBF:  # Phonetic Extensions
+            return True
+    return False
+
+def is_embedding_literal_candidate(term, embedding_model=None):
+    """Return whether a string literal should be embedded."""
+    if len(term) <= 1:
+        return False
+    if not literal_base.is_human_readable(term):
+        return False
+    if _has_suspicious_unicode(term, embedding_model):
+        return False
+
+    if (embedding_model or DEFAULT_EMBEDDING_MODEL) == "Lihuchen/pearl_small":
+        return _is_latin_text(term)
+    return True
 
 def load_string_model(embedding_model=None):
     global model_name, Str_model, Str_tokenizer
@@ -70,17 +131,6 @@ def encode_text(model, input_texts):
 
     return embeddings
 
-
-def string_similarity(input_texts):
-    '''
-    input_texts: list of strings [source, target1, target2, ...]
-    '''
-    model, _ = load_string_model()
-    embeddings = encode_text(model, input_texts)
-    scores = (embeddings[:1] @ embeddings[1:].T) # no * 100
-    return scores.tolist()
-
-
 def embedding_strings(kb, batch_size=64, embedding_model=None, emb_file=None):
     model, _ = load_string_model(embedding_model)
     literal2id = {} # {literal:id}
@@ -91,13 +141,7 @@ def embedding_strings(kb, batch_size=64, embedding_model=None, emb_file=None):
     for object in literal_objects:
         if literal_base.isLiteral(object):
             term, _, _, type = literal_base.splitLiteral(object)
-            if len(term) <= 1:
-                # print("Empty/Short literal: ", term, object)
-                continue
-            if (not literal_base.is_human_readable(term)) and type == 'xsd:string':
-                # print("Unreadable literal: ", term, object)
-                continue
-            if type == 'xsd:string' and literal_base.is_human_readable(term):
+            if type == 'xsd:string' and is_embedding_literal_candidate(term, embedding_model):
                 if term in literal2id:
                     continue
                 literal2id[term] = cnt
@@ -120,8 +164,9 @@ def embedding_strings(kb, batch_size=64, embedding_model=None, emb_file=None):
     for i in tqdm(range(0, len(literals), batch_size),
                   desc="        Computing embeddings"):
         batch_literals = literals[i:i + batch_size]
+        batch_inputs = [_normalize_for_embedding(literal) for literal in batch_literals]
         with torch.no_grad():
-            batch_embeddings = encode_text(model, batch_literals).cpu().numpy().astype(np.float32, copy=False)
+            batch_embeddings = encode_text(model, batch_inputs).cpu().numpy().astype(np.float32, copy=False)
 
         # Preallocate once and fill by slice.
         if embedding_matrix is None:
@@ -140,7 +185,7 @@ def embedding_strings(kb, batch_size=64, embedding_model=None, emb_file=None):
     return {"id": literal2id, "emb": embedding_matrix}
 
 # Memory-efficient approach. It's useful for large knowledge graphs where loading the entire graph may not be feasible due to memory constraints.
-def embedding_strings_from_ttl(path, batch_size=64, embedding_model=None, emb_file=None, fast_line_parser=True):
+def embedding_strings_from_ttl(path, batch_size=64, embedding_model=None, emb_file=None, fast_line_parser=False):
     """Compute embeddings by streaming TTL literals without loading the full KG."""
     model, _ = load_string_model(embedding_model)
     literal2id = {}
@@ -151,11 +196,7 @@ def embedding_strings_from_ttl(path, batch_size=64, embedding_model=None, emb_fi
         if not literal_base.isLiteral(obj):
             continue
         term, _, _, type = literal_base.splitLiteral(obj)
-        if len(term) <= 1:
-            continue
-        if (not literal_base.is_human_readable(term)) and type == 'xsd:string':
-            continue
-        if type == 'xsd:string' and literal_base.is_human_readable(term):
+        if type == 'xsd:string' and is_embedding_literal_candidate(term, embedding_model):
             if term in literal2id:
                 continue
             literal2id[term] = len(literals)
@@ -173,8 +214,9 @@ def embedding_strings_from_ttl(path, batch_size=64, embedding_model=None, emb_fi
     for i in tqdm(range(0, len(literals), batch_size), 
                   desc="        Computing embeddings"):
         batch_literals = literals[i:i + batch_size]
+        batch_inputs = [_normalize_for_embedding(literal) for literal in batch_literals]
         with torch.no_grad():
-            batch_embeddings = encode_text(model, batch_literals).cpu().numpy().astype(np.float32, copy=False)
+            batch_embeddings = encode_text(model, batch_inputs).cpu().numpy().astype(np.float32, copy=False)
 
         if embedding_matrix is None:
             shape = (len(literals), batch_embeddings.shape[1])
@@ -205,7 +247,7 @@ def compute_literal_embeddings(kb1, kb2, emb_path, batch_size=128, embedding_mod
         pickle.dump(kb2_emb, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 # Memory-efficient approach. It's useful for large knowledge graphs where loading the entire graph may not be feasible due to memory constraints.
-def compute_literal_embeddings_streaming(kg1, kg2, emb_path, batch_size=128, embedding_model=None, fast_line_parser=True):
+def compute_literal_embeddings_streaming(kg1, kg2, emb_path, batch_size=128, embedding_model=None, fast_line_parser=False):
     if not os.path.exists(emb_path):
         os.makedirs(emb_path)
 
@@ -239,11 +281,22 @@ def get_params():
     parser.add_argument("emb_path", type=str, metavar='DIR', help="Output folder for kb1.pkl and kb2.pkl, e.g., ../data/emb/my_dataset/")
     parser.add_argument("--embedding_model", type=str, metavar='MODEL', default=DEFAULT_EMBEDDING_MODEL,
         help="HuggingFace model used to encode string literals. Default: Lihuchen/pearl_small. For multilingual embeddings, use sentence-transformers/LaBSE.")
-    parser.add_argument("--batch_size", type=int, metavar='INT', default=128, help="Literal encoding batch size; requires INT")
-    parser.add_argument("--literal_parser", choices=["fast", "turtle"], metavar='{fast,turtle}', default="fast",
-        help="TTL literal parser used for streaming extraction: fast for one-triple-per-line fast scanner ; turtle for full Turtle parser (slower but more robust)",
+    parser.add_argument("--batch_size", type=int, metavar='INT', default=128, help="Literal encoding batch size; requires positive INT")
+    parser.add_argument("--literal_parser", choices=["fast", "turtle"], metavar='{fast,turtle}', default="turtle",
+        help="TTL literal parser used for streaming extraction: turtle uses FLORA's Turtle parser (default); fast uses a faster scanner for one-triple-per-line files",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error('--batch_size must be positive')
+    paths = vars(args)
+    for key in ('kg1', 'kg2', 'emb_path'):
+        if not paths[key].strip():
+            parser.error('%s must not be empty' % key)
+        paths[key] = os.path.abspath(os.path.expanduser(paths[key]))
+    for path in (args.kg1, args.kg2):
+        if not os.path.isfile(path):
+            parser.error('Input file does not exist: %s' % path)
+    return args
 
 
 if __name__ == '__main__':

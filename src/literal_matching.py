@@ -85,7 +85,7 @@ def create_faiss_inner_product_index(dim, index_type='flat', hnsw_m=32, hnsw_ef_
 
 
 #################################################################
-#                    IDF weighting helpers                      #
+#                     IDF gating helpers                        #
 #################################################################
 
 def _iter_literal_facts(kb):
@@ -132,9 +132,12 @@ def compute_literal_idf_weights(kb):
 
 
 def update_literal_score(scores, literal1, literal2, score, weights1=None, weights2=None, min_score=None):
+    """Filter a literal candidate by IDF without changing its semantic score.
+    """
+    gate_score = score
     if weights1 is not None and weights2 is not None:
-        score *= math.sqrt(weights1.get(literal1, 1.0) * weights2.get(literal2, 1.0))
-    if min_score is not None and score < min_score:
+        gate_score *= math.sqrt(weights1.get(literal1, 1.0) * weights2.get(literal2, 1.0))
+    if min_score is not None and gate_score < min_score:
         return False
     row = scores.setdefault(literal1, {})
     if score > row.get(literal2, 0):
@@ -166,8 +169,9 @@ def getLiteralBuckets(kb, literal_english_filter=False):
         # numeric handling
         if numValue is not None:
             if isinstance(numValue, (int, float)):
-                if datatype is not None: # strict for the specified the datatype
-                    quantityBucket[numValue].append(object1)
+                if datatype is not None: # typed quantities, including unit-bearing datatypes
+                    quantity_key = literal_base.numeric_quantity_key(numValue, datatype)
+                    quantityBucket[quantity_key].append(object1)
                     continue # TBD: may delete
                     # numberBucket[numValue].append(object1)
                 # e.g., "0" vs "0"^^xsd:decimal is different
@@ -195,7 +199,8 @@ def compareLiterals(sameAsScores, bucket1, bucket2, datatype=None, weights1=None
 
     The buckets are produced by getLiteralBuckets(), so each key represents a
     normalized literal value and each value is the list of original literal terms
-    that produced it. Numeric buckets use approximate numeric equality, date
+    that produced it. Numeric keys contain a dimension and canonical value;
+    numeric buckets use approximate equality only within the same dimension, date
     buckets allow prefix matches such as year-month against year-month-day, and
     digit/string-like buckets require exact normalized-key equality.
 
@@ -223,10 +228,13 @@ def compareLiterals(sameAsScores, bucket1, bucket2, datatype=None, weights1=None
     if datatype == 'string':
         pass
     elif datatype == 'quantity':
-        for key in bucket1:
-            for key2 in bucket2:
-                if math.isclose(key, key2):
-                    for object1 in bucket1[key]:
+        keys2_by_dimension = defaultdict(list)
+        for dimension2, value2 in bucket2:
+            keys2_by_dimension[dimension2].append((value2, (dimension2, value2)))
+        for dimension1, value1 in bucket1:
+            for value2, key2 in keys2_by_dimension.get(dimension1, ()):
+                if math.isclose(value1, value2):
+                    for object1 in bucket1[(dimension1, value1)]:
                         for object2 in bucket2[key2]:
                             update_literal_score(sameAsScores, object1, object2, 1.0, weights1, weights2, min_score)
     elif datatype == 'date':
@@ -290,7 +298,18 @@ def load_emb(path):
         embedding_matrix = np.load(os.path.join(os.path.dirname(path), emb['emb_path']), mmap_mode='r')
     else:
         embedding_matrix = emb['emb']
+    if (not isinstance(literal2id, dict) or embedding_matrix.ndim != 2
+        or len(literal2id) != embedding_matrix.shape[0]
+        or any(not isinstance(index, (int, np.integer)) or index < 0 or index >= len(literal2id)
+               for index in literal2id.values())):
+        raise ValueError("Invalid literal embedding shape or IDs: %s" % path)
     return literal2id, embedding_matrix
+
+
+LITERAL_SEARCH_TOP_K = 1
+LITERAL_HNSW_M = 32
+LITERAL_HNSW_EF_SEARCH = 64
+LITERAL_HNSW_EF_CONSTRUCTION = 200
 
 def mapLiterals(
     kb1,
@@ -300,20 +319,16 @@ def mapLiterals(
     literal_identity_only=False,
     threshold=0.5,
     chunk_size=32768,
-    top_k=1,
     literal_english_filter=False,
     literal_idf=False,
     literal_faiss_index='flat',
-    literal_hnsw_m=32,
-    literal_hnsw_ef_search=64,
-    literal_hnsw_ef_construction=200,
 ):
     """
     Compute literal-based initialization scores between two knowledge bases.
 
     This is the main literal matching pipeline. It groups literal objects by
     datatype/normalized value, adds exact numeric/date/string matches, optionally
-    applies subject-level IDF weighting, and then uses FAISS over precomputed
+    applies subject-level IDF gating, and then uses FAISS over precomputed
     literal embeddings to find approximate string matches. The resulting literal
     matches are merged into sameAsScore in place.
 
@@ -333,30 +348,23 @@ def mapLiterals(
         Minimum embedding similarity score for unweighted FAISS matches.
     chunk_size : int, optional
         Number of source literal embeddings queried per FAISS batch.
-    top_k : int, optional
-        Number of target literals retrieved for each source literal.
     literal_english_filter : bool, optional
         Keep only likely English string literals before string matching.
     literal_idf : bool, optional
-        Reweight scores using subject-level literal IDF.
+        Filter candidates using subject-level literal IDF while retaining the
+        original similarity of candidates that pass the gate.
     literal_faiss_index : str, optional
         FAISS index type, either 'flat' for exact search or 'hnsw' for approximate CPU search.
-    literal_hnsw_m : int, optional
-        HNSW graph degree when literal_faiss_index is 'hnsw'.
-    literal_hnsw_ef_search : int, optional
-        HNSW efSearch value when literal_faiss_index is 'hnsw'.
-    literal_hnsw_ef_construction : int, optional
-        HNSW efConstruction value when literal_faiss_index is 'hnsw'.
     """
     total_start = time.time()
     mapScores = {}
     logging.info(
-        "Literal matching started | identity_only=%s | threshold=%s | chunk_size=%s | top_k=%s | "
+        "Literal matching started | identity_only=%s | threshold=%s | chunk_size=%s | "
         "english_filter=%s | faiss_index=%s | hnsw_m=%s | hnsw_ef_search=%s | "
         "hnsw_ef_construction=%s | embedding=%s",
-        literal_identity_only, threshold, chunk_size, top_k,
-        literal_english_filter, literal_faiss_index, literal_hnsw_m, literal_hnsw_ef_search,
-        literal_hnsw_ef_construction, path_emb,
+        literal_identity_only, threshold, chunk_size,
+        literal_english_filter, literal_faiss_index, LITERAL_HNSW_M, LITERAL_HNSW_EF_SEARCH,
+        LITERAL_HNSW_EF_CONSTRUCTION, path_emb,
     )
     # Build literal buckets
     stage_start = time.time()
@@ -379,31 +387,31 @@ def mapLiterals(
         logging.info(
             "Literal IDF weights computed | elapsed_min=%.3f | kb1=%s | kb2=%s",
             (time.time() - stage_start) / 60, len(weights1), len(weights2),
-)
-    weighted_min_score = threshold if literal_idf else None
+        )
+    idf_gate_min_score = threshold if literal_idf else None
     if not literal_identity_only:
         # Exact matches are handled first, 
         # so that FAISS search can skip source literals that already have a perfect match.
 
         # Dates
         stage_start = time.time()
-        compareLiterals(mapScores, dateBucket1, dateBucket2, 'date', weights1, weights2, weighted_min_score)
+        compareLiterals(mapScores, dateBucket1, dateBucket2, 'date', weights1, weights2, idf_gate_min_score)
         # Compare numbers
-        compareLiterals(mapScores, quantityBucket1, quantityBucket2, 'quantity', weights1, weights2, weighted_min_score)
-        compareLiterals(mapScores, digitBucket1, digitBucket2, 'digit', weights1, weights2, weighted_min_score)
+        compareLiterals(mapScores, quantityBucket1, quantityBucket2, 'quantity', weights1, weights2, idf_gate_min_score)
+        compareLiterals(mapScores, digitBucket1, digitBucket2, 'digit', weights1, weights2, idf_gate_min_score)
         logging.info(
             "Literal date/number matching done | elapsed_min=%.3f | sources=%s | pairs=%s",
             (time.time() - stage_start) / 60, len(mapScores), sum(len(values) for values in mapScores.values()),
         )
         # Compare strings
         stage_start = time.time()
-        compareLiterals_identity(mapScores, strBucket1, strBucket2, weights1, weights2, weighted_min_score) # first get exact match
+        compareLiterals_identity(mapScores, strBucket1, strBucket2, weights1, weights2, idf_gate_min_score) # first get exact match
         logging.info(
             "Literal exact string matching done | elapsed_min=%.3f | sources=%s | pairs=%s",
             (time.time() - stage_start) / 60, len(mapScores), sum(len(values) for values in mapScores.values()),
         )
 
-        # Embedding-based string matching using FAISS
+        # Embedding-based string matching.
 
         emb1_path = os.path.join(path_emb, 'kb1.pkl')
         emb2_path = os.path.join(path_emb, 'kb2.pkl')
@@ -412,6 +420,8 @@ def mapLiterals(
             stage_start = time.time()
             literal2id_kb1, embedding_matrix_kb1 = load_emb(emb1_path)
             literal2id_kb2, embedding_matrix_kb2 = load_emb(emb2_path)
+            if embedding_matrix_kb1.shape[1] != embedding_matrix_kb2.shape[1]:
+                raise ValueError("KG1 and KG2 literal embeddings have different dimensions")
             logging.info(
                 "Literal embeddings loaded | elapsed_min=%.3f | kb1_literals=%s | kb2_literals=%s",
                 (time.time() - stage_start) / 60, len(literal2id_kb1), len(literal2id_kb2),
@@ -475,20 +485,19 @@ def mapLiterals(
                 emb1_valid = np.ascontiguousarray(normalize_embedding_matrix(embedding_matrix_kb1[candidate_ids1]), dtype=np.float32)
                 emb2_valid = np.ascontiguousarray(normalize_embedding_matrix(embedding_matrix_kb2[candidate_ids2]), dtype=np.float32)
                 logging.info(
-                    "Literal FAISS matrices prepared | elapsed_min=%.3f | emb1_shape=%s | emb2_shape=%s",
+                    "Literal embedding matrices prepared | elapsed_min=%.3f | emb1_shape=%s | emb2_shape=%s",
                     (time.time() - stage_start) / 60, emb1_valid.shape, emb2_valid.shape,
                 )
 
-                # FAISS inner-product search
-                # Since embeddings are L2-normalized, inner product = cosine similarity.
+                # Since embeddings are L2-normalized, FAISS inner product is cosine similarity.
                 dim = emb2_valid.shape[1]
                 # Keep gpu_res alive for the lifetime of the GPU FAISS index.
                 index, gpu_res = create_faiss_inner_product_index(
                     dim,
                     index_type=literal_faiss_index,
-                    hnsw_m=literal_hnsw_m,
-                    hnsw_ef_search=literal_hnsw_ef_search,
-                    hnsw_ef_construction=literal_hnsw_ef_construction,
+                    hnsw_m=LITERAL_HNSW_M,
+                    hnsw_ef_search=LITERAL_HNSW_EF_SEARCH,
+                    hnsw_ef_construction=LITERAL_HNSW_EF_CONSTRUCTION,
                 )
                 stage_start = time.time()
                 index.add(emb2_valid)
@@ -497,9 +506,8 @@ def mapLiterals(
                     (time.time() - stage_start) / 60, len(candidate_keys2), dim,
                 )
 
-                # Query in batches to avoid allocating large arrays
+                # Query in batches to avoid allocating large arrays.
                 query_batch_size = chunk_size
-                search_k = min(top_k, len(candidate_keys2))
 
                 stage_start = time.time()
                 for start1 in range(0, len(candidate_keys1), query_batch_size):
@@ -507,7 +515,7 @@ def mapLiterals(
 
                     block_emb1 = np.ascontiguousarray(emb1_valid[start1:end1], dtype=np.float32)
 
-                    local_best_scores, local_best_indices = index.search(block_emb1, search_k)
+                    local_best_scores, local_best_indices = index.search(block_emb1, LITERAL_SEARCH_TOP_K)
 
                     for row_idx, key1 in enumerate(candidate_keys1[start1:end1]):
                         for best_score, idx2 in zip(local_best_scores[row_idx], local_best_indices[row_idx]):
@@ -530,9 +538,9 @@ def mapLiterals(
                                     mapScores[object1] = {}
 
                                 for object2 in strBucket2[literal2]:
-                                    update_literal_score(mapScores, object1, object2, best_score, weights1, weights2, weighted_min_score)
+                                    update_literal_score(mapScores, object1, object2, best_score, weights1, weights2, idf_gate_min_score)
                 logging.info(
-                    "Literal FAISS search done | elapsed_min=%.3f | sources=%s | pairs=%s",
+                    "Literal FAISS top-1 search done | elapsed_min=%.3f | sources=%s | pairs=%s",
                     (time.time() - stage_start) / 60, len(mapScores), sum(len(values) for values in mapScores.values()),
                 )
         else: # no embeddings files available
@@ -540,10 +548,10 @@ def mapLiterals(
     else:
         # Identity mapping only
         stage_start = time.time()
-        compareLiterals_identity(mapScores, strBucket1, strBucket2, weights1, weights2, weighted_min_score)
-        compareLiterals_identity(mapScores, dateBucket1, dateBucket2, weights1, weights2, weighted_min_score)
-        compareLiterals_identity(mapScores, quantityBucket1, quantityBucket2, weights1, weights2, weighted_min_score)
-        compareLiterals_identity(mapScores, digitBucket1, digitBucket2, weights1, weights2, weighted_min_score)
+        compareLiterals_identity(mapScores, strBucket1, strBucket2, weights1, weights2, idf_gate_min_score)
+        compareLiterals_identity(mapScores, dateBucket1, dateBucket2, weights1, weights2, idf_gate_min_score)
+        compareLiterals_identity(mapScores, quantityBucket1, quantityBucket2, weights1, weights2, idf_gate_min_score)
+        compareLiterals_identity(mapScores, digitBucket1, digitBucket2, weights1, weights2, idf_gate_min_score)
         logging.info(
             "Literal identity matching done | elapsed_min=%.3f | sources=%s | pairs=%s",
             (time.time() - stage_start) / 60, len(mapScores), sum(len(values) for values in mapScores.values()),
@@ -614,7 +622,7 @@ class LiteralOnlyGraph:
                 yield subject, None, obj
 
 
-def load_literal_only_graph_from_ttl(path, collect_subjects=False, fast_line_parser=True):
+def load_literal_only_graph_from_ttl(path, collect_subjects=False, fast_line_parser=False):
     """Scan a TTL file and return a literal-only in-memory graph adapter.
 
     This avoids materializing the complete RDF graph. It stores unique literal
@@ -646,22 +654,39 @@ def get_params():
     parser = argparse.ArgumentParser(description="Compute FLORA literal matching scores.")
     parser.add_argument("--kg1", type=str, metavar='PATH',required=True, help="KG1 Turtle file, e.g., ../data/my_dataset/kg1.ttl")
     parser.add_argument("--kg2", type=str, metavar='PATH', required=True, help="KG2 Turtle file, e.g., ../data/my_dataset/kg2.ttl")
-    parser.add_argument("--embedding", type=str, metavar='DIR', required=True, help="Folder containing kb1.pkl/kb2.pkl literal embeddings, e.g., ../data/emb/my_dataset/")
+    parser.add_argument("--embedding", type=str, metavar='DIR', help="Folder containing kb1.pkl/kb2.pkl literal embeddings; required unless --string_identity is set")
     parser.add_argument("--output", type=str, metavar='PATH', required=True, help="Output pickle path for literal sameAs scores, e.g., ../data/literal_matching/my_dataset/literal_scores.pkl")
-    parser.add_argument("--init", type=float, metavar='FLOAT', default=0.7, help="Initial literal similarity threshold; requires FLOAT in [0, 1]")
+    parser.add_argument("--init", type=float, metavar='FLOAT', default=0.7, help="Initial literal similarity threshold; requires finite FLOAT in [0, 1]")
     parser.add_argument("--string_identity", action="store_true", help="Boolean flag : Use exact literal identity only")
-    parser.add_argument("--chunk_size", type=int, metavar='INT', default=32768, help="FAISS query batch size; requires INT")
-    parser.add_argument("--top_k", type=int, metavar='INT', default=1, help="Number of target literals retrieved per source literal; requires INT")
+    parser.add_argument("--chunk_size", type=int, metavar='INT', default=32768, help="FAISS query batch size; requires positive INT")
     parser.add_argument("--literal_english_filter", action="store_true", help="Boolean flag : keep only English literals during literal initialization")
-    parser.add_argument("--literal_idf", action="store_true", help="Boolean flag : reweight literal initialization scores with literal IDF to filter out common literals")
+    parser.add_argument("--literal_idf", action="store_true", help="Boolean flag : use literal IDF to filter common candidates without changing the retained similarity scores")
     parser.add_argument("--literal_faiss_index", choices=["flat", "hnsw"], metavar='{flat,hnsw}', default="flat", help='FAISS index for literal embedding search : flat is exact search and can use GPU; hnsw is approximate CPU search')
-    parser.add_argument("--literal_hnsw_m", type=int, metavar='INT', default=32, help='HNSW graph degree for --literal_faiss_index hnsw ; requires INT')
-    parser.add_argument("--literal_hnsw_ef_search", type=int, metavar='INT', default=64, help='HNSW search parameter for --literal_faiss_index hnsw ; requires INT')
-    parser.add_argument("--literal_hnsw_ef_construction", type=int, metavar='INT', default=200, help='HNSW construction parameter for --literal_faiss_index hnsw ; requires INT')
-    parser.add_argument("--literal_parser", choices=["fast", "turtle"], metavar='{fast,turtle}', default="fast",
-        help="TTL literal parser used for streaming extraction: fast for one-triple-per-line fast scanner ; turtle for full Turtle parser (slower but more robust)",
+    parser.add_argument("--literal_embedding_model", type=str, default="Lihuchen/pearl_small", help="Model used to precompute the literal embeddings")
+    parser.add_argument("--literal_parser", choices=["fast", "turtle"], metavar='{fast,turtle}', default="turtle",
+        help="TTL literal parser used for streaming extraction: turtle uses FLORA's Turtle parser (default); fast uses a faster scanner for one-triple-per-line files",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0 <= args.init <= 1:
+        parser.error('--init must be finite and in [0, 1]')
+    if args.chunk_size <= 0:
+        parser.error('--chunk_size must be positive')
+    paths = vars(args)
+    for key in ('kg1', 'kg2', 'embedding', 'output'):
+        if paths[key] is not None:
+            if not paths[key].strip():
+                parser.error('--%s must not be empty' % key)
+            paths[key] = os.path.abspath(os.path.expanduser(paths[key]))
+    for path in (args.kg1, args.kg2):
+        if not os.path.isfile(path):
+            parser.error('Input file does not exist: %s' % path)
+    if args.embedding is None and not args.string_identity:
+        parser.error('--embedding is required unless --string_identity is set')
+    if not args.string_identity:
+        for name in ('kb1.pkl', 'kb2.pkl'):
+            if not os.path.isfile(os.path.join(args.embedding, name)):
+                parser.error('Missing embedding file: %s' % os.path.join(args.embedding, name))
+    return args
 
 def main():
     args = get_params()
@@ -685,13 +710,9 @@ def main():
         literal_identity_only=args.string_identity,
         threshold=args.init,
         chunk_size=args.chunk_size,
-        top_k=args.top_k,
         literal_english_filter=args.literal_english_filter,
         literal_idf=args.literal_idf,
         literal_faiss_index=args.literal_faiss_index,
-        literal_hnsw_m=args.literal_hnsw_m,
-        literal_hnsw_ef_search=args.literal_hnsw_ef_search,
-        literal_hnsw_ef_construction=args.literal_hnsw_ef_construction,
     )
     Announce.done()
 

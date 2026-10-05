@@ -1,17 +1,26 @@
-# FLORA
+# FLORA+
 
-_This repository contains a Python implementation of [FLORA: Unsupervised Knowledge Graph Alignment by Fuzzy Logic](https://suchanek.name/work/publications/iswc-2025.pdf), best paper award at ISWC 2025._
+This repository provides the Python implementation of FLORA+.
+FLORA+ is an efficient and scalable method for jointly aligning entities and relations across knowledge graphs. It builds on FLORA's unsupervised fuzzy-logic reasoning framework, with optimizations that reduce runtime and memory consumption on large-scale KGs.
+
+## FLORA
+
+FLORA+ builds on [FLORA: Unsupervised Knowledge Graph Alignment by Fuzzy Logic](https://suchanek.name/work/publications/iswc-2025.pdf), best paper award at ISWC 2025.
 
 ![FLORA pipeline](docs/pipeline.png)
-FLORA is an unsupervised system for automatic knowledge graph (KG) alignment, jointly matching entities and relations in one KG to their equivalents in another.
+FLORA is a simple yet effective method that (1) is unsupervised, i.e., does not require training data, (2) provides a holistic
+alignment for entities and relations iteratively, (3) is based on fuzzy logic and thus delivers interpretable results, (4) provably converges, (5) allows dangling entities, i.e., entities without a counterpart in the other KG, and (6) achieves state-of-the-art results on major benchmarks.
 
-## This Version
+FLORA extends [PARIS](https://github.com/dig-team/PARIS) system, which had three key limitations: (1) no convergence guarantees, (2) poor performance when functional relations are absent, and (3) the inability to see literal similarities beyond a strict identity.
 
-This version keeps the original FLORA algorithmic structure and logic, but adds several engineering improvements for larger KGs:
+## This Version - FLORA+
+![FLORA workflow](docs/architecture_code.png)
+This version keeps the original FLORA algorithmic structure and logic, but adds several optimizations for larger KGs:
 
+- Compact KG storage based on read-only memory-mapped arrays for large datasets.
 - FAISS-based literal matching, including exact flat search and approximate HNSW search.
-- Optional IDF weighting for frequent literals.
-- Optional compact KG storage based on read-only memory-mapped arrays for large datasets.
+- Optional IDF-based literal filtering for frequent literals.
+- Selectivity-aware candidate search to prune costly, low-selectivity expansions.
 - Multiprocessing controls for bootstrapping, entity alignment, and subrelation mapping.
 
 ## Installation
@@ -24,24 +33,16 @@ conda activate flora
 pip install -r requirements.txt
 ```
 
-Literal matching also requires FAISS, which is installed separately so you can choose the CPU or GPU build for your machine.
-
-For CPU FAISS:
+The default installation includes CPU FAISS. To use GPU FAISS instead, remove the CPU build first and install the GPU build with conda:
 
 ```bash
-pip install "faiss-cpu>=1.9.0,<2.0"
-```
-
-For GPU FAISS, conda is recommended:
-
-```bash
+pip uninstall -y faiss-cpu
 conda install -c pytorch -c nvidia -c conda-forge "faiss-gpu>=1.9.0,<2.0"
 ```
 
-Use either `faiss-cpu` or `faiss-gpu`, not both. GPU FAISS is recommended for large kgs.
+Use either `faiss-cpu` or `faiss-gpu`, not both.
 
 ## Running FLORA
-![FLORA workflow](docs/flora_workflow.png)
 Run the commands below from the `src/` directory:
 
 ```bash
@@ -54,8 +55,8 @@ cd src
 python main.py \
   --kg1 ../data/small-test/mini/mini1.ttl \
   --kg2 ../data/small-test/mini/mini2.ttl \
-  --embedding ../data/emb/mini/ \
-  --output ../save/mini-test.ttl
+  --string_identity \
+  --output ../save/results/mini-test.ttl
 ```
 
 The two toy KGs each contain one labeled Elvis entity and one `marriedTo` fact, using different prefixes:
@@ -63,27 +64,15 @@ The two toy KGs each contain one labeled Elvis entity and one `marriedTo` fact, 
 - `mini1.ttl`: `yago:Elvis rdfs:label "Elvis"` and `yago:Elvis yago:marriedTo yago:Priscilla`
 - `mini2.ttl`: `dbp:Elvis rdfs:label "Elvis"` and `dbp:Elvis dbp:marriedTo dbp:Priscilla`
 
-The `../data/emb/mini/` folder contains the precomputed literal embeddings used for the example. FLORA writes the alignment output to `../save/mini-test.ttl`; the file contains prefix declarations followed by scored relation alignments, such as `yago:marriedTo rdfs:subPropertyOf dbp:marriedTo`, literal matching results, such as `"Elvis"	owl:sameAs	"Elvis"`, and entity alignments, such as `yago:Elvis owl:sameAs dbp:Elvis`.
+The toy example uses exact literal matching and does not require embedding precomputation. FLORA writes prefix declarations and scored literal, entity, and relation alignments to `../save/results/mini-test.ttl`.
 
-### Custom Turtle Files
-
-For custom KGs, pass the Turtle files explicitly:
-
-```bash
-python main.py \
-  --kg1 ../data/my_dataset/kg1.ttl \
-  --kg2 ../data/my_dataset/kg2.ttl \
-  --embedding ../data/emb/my_dataset/ \
-  --output ../save/my_dataset.ttl
-```
-
-Input KGs should be in Turtle format.
+We also provide two mini-test datasets: [Person, Restaurant](https://oaei.ontologymatching.org/2010/im/index.html) from OAEI 2010 for quick test. 
 
 ### Precomputing Literal Embeddings
 
-Literal embeddings can be computed independently from the main FLORA loop. Because literal embedding computation benefits from GPU acceleration, while the main loop of FLORA needs only CPUs.
+To initialize literal similarities, FLORA needs embeddings for all strings (excluding dates and numbers). Computing these embeddings separately lets you use a GPU for embedding generation, save the results, and then run the subsequent alignment steps on CPUs using the saved embeddings. This frees up GPU resources as soon as embedding generation finishes, instead of keeping them allocated throughout the alignment process.
 
-
+For example:
 ```bash
 python literal_embedding.py \
   ../data/my_dataset/kg1.ttl \
@@ -92,54 +81,28 @@ python literal_embedding.py \
   --embedding_model Lihuchen/pearl_small
 ```
 
-By default, literal extraction uses a fast scanner for large one-triple-per-line Turtle files. If your files use more general Turtle syntax, switch to FLORA's Turtle parser:
+Choose the embedding model with `--embedding_model` according to the languages in your KGs:
 
-```bash
-python literal_embedding.py \
-  ../data/my_dataset/kg1.ttl \
-  ../data/my_dataset/kg2.ttl \
-  ../data/emb/my_dataset/ \
-  --literal_parser turtle
-```
+- For monolingual matching with predominantly Latin-script text, use `Lihuchen/pearl_small` (the default).
+- For multilingual or cross-language matching, or KGs containing non-Latin text, use `--embedding_model sentence-transformers/LaBSE`.
 
-To reuse the precomputed embeddings, pass the same folder to the main run:
+For faster, memory-friendly literal extraction from large files containing one complete triple per line, add `--literal_parser fast` to the command above.
+
+### Custom Turtle Files
+
+Once the literal embeddings have been precomputed, run the main alignment process. For custom KGs, pass the Turtle files explicitly and use `--embedding` to point to the same folder created above:
 
 ```bash
 python main.py \
   --kg1 ../data/my_dataset/kg1.ttl \
   --kg2 ../data/my_dataset/kg2.ttl \
   --embedding ../data/emb/my_dataset/ \
-  --output ../save/my_dataset.ttl
+  --output ../save/results/my_dataset.ttl
 ```
 
-### Precomputing Literal SameAs Scores
+Input KGs should be in Turtle format.
 
-Literal SameAs scores can also be computed independently. Because faiss-based literal matching benefits from GPU acceleration, while the main loop of FLORA needs only CPUs. 
-Run this after literal embeddings have been created, unless you use `--string_identity` (which means use only exact string matches.):
-
-```bash
-python literal_matching.py \
-  --kg1 ../data/my_dataset/kg1.ttl \
-  --kg2 ../data/my_dataset/kg2.ttl \
-  --embedding ../data/emb/my_dataset/ \
-  --output ../data/literal_matching/my_dataset/literal_scores.pkl \
-  --init 0.7 \
-  --literal_faiss_index hnsw
-```
-
-As with literal embeddings, `--literal_parser fast` is the default for one-triple-per-line Turtle files. Use `--literal_parser turtle` for general Turtle parsing.
-
-To reuse the precomputed scores, pass the pickle file to the main run. When `--literal_scores` is provided, FLORA loads these scores directly and skips literal embedding and literal matching precomputation:
-
-```bash
-python main.py \
-  --kg1 ../data/my_dataset/kg1.ttl \
-  --kg2 ../data/my_dataset/kg2.ttl \
-  --literal_scores ../data/literal_scores/my_dataset_literal_scores.pkl \
-  --output ../save/my_dataset.ttl
-```
-
-### Large-KG Options
+<!-- ### Large-KG Options
 
 For larger kgs, start with compact storage and explicit worker counts:
 
@@ -148,46 +111,53 @@ python main.py \
   --kg1 ../data/my_large_kg/source.ttl \
   --kg2 ../data/my_large_kg/target.ttl \
   --embedding ../data/emb/my_large_kg/ \
-  --output ../save/my_large_kg.ttl \
+  --output ../save/results/my_large_kg.ttl \
   --alpha 3.0 \
   --init 0.7 \
-  --compact_kg \
+  --compact_kg true \
   --workers 40 \
   --bootstrap_workers 40 \
   --subrelation_workers 40
-```
+``` -->
 
-If seed alignments are available, pass them with `--trainingdata`. This path is resolved under `../data/`:
+If seed alignments are available, pass their path with `--trainingdata`:
 
 ```bash
 python main.py \
   --kg1 ../data/my_large_kg/source.ttl \
   --kg2 ../data/my_large_kg/target.ttl \
   --embedding ../data/emb/my_large_kg/ \
-  --trainingdata my_large_kg/train_links \
-  --output ../save/my_large_kg-supervised.ttl
+  --trainingdata ../data/my_large_kg/train_links \
+  --output ../save/results/my_large_kg-supervised.ttl
 ```
 
 Logs are written to `../save/logs/`.
 
 ## Reproducing the Experiments
 
+**Dataset.**
 FLORA uses datasets from:
 
 - [OpenEA](https://github.com/nju-websoft/OpenEA): `D_W_15K_V1`, `D_W_15K_V2`
 - [DBP15K](https://github.com/nju-websoft/JAPE): `fr_en`, `ja_en`, `zh_en`
 - [OAEI KG Track](https://oaei.ontologymatching.org/2024/knowledgegraph/index.html): `memoryalpha-stexpanded`, `starwars-swtor`
+- [DBP1M](https://github.com/ZJU-DAILY/LargeEA):`de_en`, `fr_en`,
+- **DBpedia-YAGO**: a large-scale, real-world EA dataset based on English DBpedia and YAGO data constructed by ourselves.
 
-Due to memory limitations, all datasets and pretrained embeddings used in the paper are on the [drive](https://nextcloud.r2.enst.fr/nextcloud/index.php/s/xj3oStmzLcknicr?opendetails=). Download and unzip the files from the drive into the matching subdirectories under `FLORA/data/` so that the preconfigured commands can resolve their default paths after the files are downloaded.
+Due to memory limitations, all datasets and pretrained embeddings used in the paper are on the [drive](https://nextcloud.r2.enst.fr/nextcloud/index.php/s/xj3oStmzLcknicr?opendetails=). Download and unzip the files from the drive into the matching subdirectories under `FLORA/data/`.
 
-## Evaluation and Analysis
+For detailed statistics on each dataset, please refer to `statistics.pdf`.
 
+After preparing the datasets and embeddings, use the commands in [scripts/run.sh](scripts/run.sh) to reproduce the experimental results. To run all configured experiments, execute `bash scripts/run.sh` from the repository root.
+
+
+**Evaluation and Analysis.**
 Alignment outputs are written to the path given with `--output`, commonly under `save/results/`. For evaluation and analysis, use the notebooks or scripts in the repository.
 
-## Attribution and License
+<!-- ## Attribution and License
 
 This codebase is adapted from the [original FLORA implementation](https://github.com/dig-team/FLORA) by Yiwen Peng, Thomas Bonald, and Fabian Suchanek. 
-The code is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0). 
+The code is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).  -->
 
 ## Citation
 

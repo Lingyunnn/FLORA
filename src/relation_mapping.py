@@ -7,10 +7,7 @@ Description: Predicate subrelation mapping utilities, including chunked and comp
 
 from collections import OrderedDict
 import multiprocessing as mp
-import time
 import logging
-from queue import Empty, Full
-
 import alignment_base
 import log
 import side_keys
@@ -318,41 +315,34 @@ def _map_subrelations_direction(alpha, facts_iterable, kb_lookup, ent_max_assign
             task.start()
             tasks.append(task)
 
-        def merge_ready_results():
+        def merge_result(result):
             nonlocal finished_workers, processed_facts, matched_facts
-            drained = 0
-            while True:
-                try:
-                    result = result_queue.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                if result is None:
-                    finished_workers += 1
-                    continue
-                _, chunk_mapping, chunk_processed, chunk_matched = result
-                merge_additive_score_mapping(mapping, chunk_mapping)
-                processed_facts += chunk_processed
-                matched_facts += chunk_matched
-            return drained
+            if result is None:
+                finished_workers += 1
+                return
+            _, chunk_mapping, chunk_processed, chunk_matched = result
+            merge_additive_score_mapping(mapping, chunk_mapping)
+            processed_facts += chunk_processed
+            matched_facts += chunk_matched
 
         for fact_chunk in iter_fact_chunks(facts_iterable):
-            while True:
-                try:
-                    task_queue.put_nowait((submitted_chunks, fact_chunk))
-                    submitted_chunks += 1
-                    break
-                except Full:
-                    merge_ready_results()
-                    if progress_logger is not None:
-                        progress_logger(
-                            direction=direction,
-                            submitted_chunks=submitted_chunks,
-                            processed_facts=f"{processed_facts}/{source_total_facts}",
-                            finished_workers=finished_workers,
-                        )
-                    time.sleep(alignment_base.RESULT_DRAIN_INTERVAL)
-            merge_ready_results()
+            alignment_base._put_task_with_drain(
+                task_queue,
+                (submitted_chunks, fact_chunk),
+                result_queue=result_queue,
+                merge_fn=merge_result,
+                progress_logger=progress_logger,
+                progress_fields={
+                    'direction': direction,
+                    'submitted_chunks': submitted_chunks,
+                    'processed_facts': f"{processed_facts}/{source_total_facts}",
+                    'finished_workers': finished_workers,
+                },
+                worker_tasks=tasks,
+                stage_label=stage_label,
+            )
+            submitted_chunks += 1
+            alignment_base.drain_queue_items(result_queue, merge_result)
             if progress_logger is not None:
                 progress_logger(
                     direction=direction,
@@ -362,36 +352,25 @@ def _map_subrelations_direction(alpha, facts_iterable, kb_lookup, ent_max_assign
                 )
 
         for _ in range(num_workers):
-            while True:
-                try:
-                    task_queue.put_nowait(None)
-                    break
-                except Full:
-                    merge_ready_results()
-                    time.sleep(alignment_base.RESULT_DRAIN_INTERVAL)
-
-        while finished_workers < num_workers:
-            merge_ready_results()
-            if progress_logger is not None:
-                progress_logger(
-                    direction=direction,
-                    submitted_chunks=submitted_chunks,
-                    processed_facts=f"{processed_facts}/{source_total_facts}",
-                    finished_workers=finished_workers,
-                )
-            time.sleep(alignment_base.RESULT_DRAIN_INTERVAL)
-
-        for task in tasks:
-            task.join()
-
-        nonzero_exitcodes = [task.exitcode for task in tasks if task.exitcode not in (None, 0)]
-        if nonzero_exitcodes:
-            logging.warning(
-                "%s subrelation worker exitcodes | direction=%s | exitcodes=%s",
-                stage_label or "Subrelation stage", direction, nonzero_exitcodes,
+            alignment_base._put_task_with_drain(
+                task_queue,
+                None,
+                result_queue=result_queue,
+                merge_fn=merge_result,
+                worker_tasks=tasks,
+                stage_label=stage_label,
             )
+
+        alignment_base.wait_for_workers_and_drain(
+            tasks,
+            result_queue,
+            merge_result,
+            stage_label=stage_label,
+            progress_interval=progress_interval,
+        )
         return mapping
     finally:
+        alignment_base.stop_workers(tasks)
         task_queue.close()
         task_queue.join_thread()
         result_queue.close()
@@ -447,48 +426,41 @@ def _map_subrelations_direction_compact(alpha, kb_src, kb_dst, ent_max_assign_id
             task.start()
             tasks.append(task)
 
-        def merge_ready_results():
+        def merge_result(result):
             nonlocal finished_workers, processed_facts, matched_facts
-            drained = 0
-            while True:
-                try:
-                    result = result_queue.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                if result is None:
-                    finished_workers += 1
-                    continue
-                _, chunk_mapping, chunk_processed = result
-                merge_additive_score_mapping(mapping, chunk_mapping)
-                processed_facts += chunk_processed
-                logging.debug(
-                    "%s compact subrelation direct worker result | direction=%s | "
-                    "processed_facts=%s",
-                    stage_label or "Subrelation stage",
-                    direction,
-                    chunk_processed,
-                )
-            return drained
+            if result is None:
+                finished_workers += 1
+                return
+            _, chunk_mapping, chunk_processed = result
+            merge_additive_score_mapping(mapping, chunk_mapping)
+            processed_facts += chunk_processed
+            logging.debug(
+                "%s compact subrelation direct worker result | direction=%s | "
+                "processed_facts=%s",
+                stage_label or "Subrelation stage",
+                direction,
+                chunk_processed,
+            )
 
         for fact_chunk in iter_candidate_fact_id_chunks(kb_src, ent_max_assign_ids.keys()):
-            while True:
-                try:
-                    task_queue.put_nowait((submitted_chunks, fact_chunk))
-                    submitted_chunks += 1
-                    break
-                except Full:
-                    merge_ready_results()
-                    if progress_logger is not None:
-                        progress_logger(
-                            direction=direction,
-                            submitted_chunks=submitted_chunks,
-                            processed_facts=f"{processed_facts}/{source_total_facts}",
-                            matched_facts=matched_facts,
-                            finished_workers=finished_workers,
-                        )
-                    time.sleep(alignment_base.RESULT_DRAIN_INTERVAL)
-            merge_ready_results()
+            alignment_base._put_task_with_drain(
+                task_queue,
+                (submitted_chunks, fact_chunk),
+                result_queue=result_queue,
+                merge_fn=merge_result,
+                progress_logger=progress_logger,
+                progress_fields={
+                    'direction': direction,
+                    'submitted_chunks': submitted_chunks,
+                    'processed_facts': f"{processed_facts}/{source_total_facts}",
+                    'matched_facts': matched_facts,
+                    'finished_workers': finished_workers,
+                },
+                worker_tasks=tasks,
+                stage_label=stage_label,
+            )
+            submitted_chunks += 1
+            alignment_base.drain_queue_items(result_queue, merge_result)
             if progress_logger is not None:
                 progress_logger(
                     direction=direction,
@@ -499,35 +471,22 @@ def _map_subrelations_direction_compact(alpha, kb_src, kb_dst, ent_max_assign_id
                 )
 
         for _ in range(num_workers):
-            while True:
-                try:
-                    task_queue.put_nowait(None)
-                    break
-                except Full:
-                    merge_ready_results()
-                    time.sleep(alignment_base.RESULT_DRAIN_INTERVAL)
-
-        while finished_workers < num_workers:
-            merge_ready_results()
-            if progress_logger is not None:
-                progress_logger(
-                    direction=direction,
-                    submitted_chunks=submitted_chunks,
-                    processed_facts=f"{processed_facts}/{source_total_facts}",
-                    matched_facts=matched_facts,
-                    finished_workers=finished_workers,
-                )
-            time.sleep(alignment_base.RESULT_DRAIN_INTERVAL)
-
-        for task in tasks:
-            task.join()
-
-        nonzero_exitcodes = [task.exitcode for task in tasks if task.exitcode not in (None, 0)]
-        if nonzero_exitcodes:
-            logging.warning(
-                "%s compact subrelation worker exitcodes | direction=%s | exitcodes=%s",
-                stage_label or "Subrelation stage", direction, nonzero_exitcodes,
+            alignment_base._put_task_with_drain(
+                task_queue,
+                None,
+                result_queue=result_queue,
+                merge_fn=merge_result,
+                worker_tasks=tasks,
+                stage_label=stage_label,
             )
+
+        alignment_base.wait_for_workers_and_drain(
+            tasks,
+            result_queue,
+            merge_result,
+            stage_label=stage_label,
+            progress_interval=progress_interval,
+        )
         logging.info(
             "%s compact subrelation direct stats | direction=%s | "
             "submitted_chunks=%s | processed_facts=%s/%s",
@@ -536,6 +495,7 @@ def _map_subrelations_direction_compact(alpha, kb_src, kb_dst, ent_max_assign_id
         )
         return mapping
     finally:
+        alignment_base.stop_workers(tasks)
         task_queue.close()
         task_queue.join_thread()
         result_queue.close()

@@ -680,7 +680,6 @@ class CompactSymbolTable(object):
 class CompactGraph(object):
     """Compact graph representation backed by mmap arrays for large KGs."""
 
-    _VERSION = 8
     _COUNT_CACHE_MAXSIZE = 262144 # max size for the local functionality count cache
     _LOCAL_FUNCTIONALITY_IDS_CACHE_MAXSIZE = 262144 # max size for multi subject-predicate local functionality cache
     _OBJECT_IDS_CACHE_MAXSIZE = 65536 # max size for the subject-predicate pair to object ids cache
