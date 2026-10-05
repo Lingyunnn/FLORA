@@ -68,10 +68,10 @@ The toy example uses exact literal matching and does not require embedding preco
 
 We also provide two mini-test datasets: [Person, Restaurant](https://oaei.ontologymatching.org/2010/im/index.html) from OAEI 2010 for quick test. 
 
-### Precomputing Literal Embeddings
+### Custom Turtle Files
 
+**Pre-compute the string embeddings.**
 To initialize literal similarities, FLORA needs embeddings for all strings (excluding dates and numbers). Computing these embeddings separately lets you use a GPU for embedding generation, save the results, and then run the subsequent alignment steps on CPUs using the saved embeddings. This frees up GPU resources as soon as embedding generation finishes, instead of keeping them allocated throughout the alignment process.
-
 For example:
 ```bash
 python literal_embedding.py \
@@ -88,8 +88,7 @@ Choose the embedding model with `--embedding_model` according to the languages i
 
 For faster, memory-friendly literal extraction from large files containing one complete triple per line, add `--literal_parser fast` to the command above.
 
-### Custom Turtle Files
-
+**Run the code.**
 Once the literal embeddings have been precomputed, run the main alignment process. For custom KGs, pass the Turtle files explicitly and use `--embedding` to point to the same folder created above:
 
 ```bash
@@ -101,24 +100,6 @@ python main.py \
 ```
 
 Input KGs should be in Turtle format.
-
-<!-- ### Large-KG Options
-
-For larger kgs, start with compact storage and explicit worker counts:
-
-```bash
-python main.py \
-  --kg1 ../data/my_large_kg/source.ttl \
-  --kg2 ../data/my_large_kg/target.ttl \
-  --embedding ../data/emb/my_large_kg/ \
-  --output ../save/results/my_large_kg.ttl \
-  --alpha 3.0 \
-  --init 0.7 \
-  --compact_kg true \
-  --workers 40 \
-  --bootstrap_workers 40 \
-  --subrelation_workers 40
-``` -->
 
 If seed alignments are available, pass their path with `--trainingdata`:
 
@@ -153,11 +134,6 @@ After preparing the datasets and embeddings, use the commands in [scripts/run.sh
 
 **Evaluation and Analysis.**
 Alignment outputs are written to the path given with `--output`, commonly under `save/results/`. For evaluation and analysis, use the notebooks or scripts in the repository.
-
-<!-- ## Attribution and License
-
-This codebase is adapted from the [original FLORA implementation](https://github.com/dig-team/FLORA) by Yiwen Peng, Thomas Bonald, and Fabian Suchanek. 
-The code is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).  -->
 
 ## Citation
 
