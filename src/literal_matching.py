@@ -63,9 +63,9 @@ def create_faiss_inner_product_index(dim, index_type='flat', hnsw_m=32, hnsw_ef_
     index = faiss.IndexFlatIP(dim)
 
     if not hasattr(faiss, "StandardGpuResources") or not hasattr(faiss, "index_cpu_to_gpu"):
-        message = "This FAISS build has no GPU support. Using CPU."
+        message = "This FAISS build use CPU."
         logging.warning(message)
-        print("   Warning: " + message, flush=True)
+        print(message, flush=True)
         return index, None
 
     try:

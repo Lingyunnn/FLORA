@@ -178,7 +178,7 @@ def load_or_compute_functionalities(graph, source_signature, graph_tag, gram, us
         if cached_value is not None:
             return cached_value
     else:
-        logging.info("Functionalities cache disabled for %s; recomputing", graph_tag)
+        logging.info("Computing functionalities for %s", graph_tag)
 
     # Temporary result files transfer worker output without retaining a cache.
     with tempfile.TemporaryDirectory(prefix='flora_functionalities_') as temp_dir:
@@ -265,7 +265,11 @@ def load_or_compute_literal_scores(kb1, kb2, emb_path, params, source_signature,
         if cached_value is not None:
             return cached_value
     else:
-        logging.info("Literal matching cache disabled; recomputing")
+        logging.info(
+            "Computing literal matching scores for %s and %s",
+            side_keys.graph_side(kb1, side_keys.KB1),
+            side_keys.graph_side(kb2, side_keys.KB2),
+        )
 
     cleanup_path = None
     if not use_cache:
