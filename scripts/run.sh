@@ -29,4 +29,4 @@ python main.py --kg1 ../data/DBP1M_with_name/de/kg1.ttl --kg2 ../data/DBP1M_with
 python main.py --kg1 ../data/DBP1M_with_name/fr/kg1.ttl --kg2 ../data/DBP1M_with_name/fr/kg2.ttl --embedding ../data/emb/DBP1M/fr/ --output ../save/results/dbp1m_fr_with_name.ttl --target_hub_degree_threshold 1000
 
 printf '==========Running KG Alignment on DBpedia_YAGO datasets==========\n'
-python main.py --kg1 ../data/dbpedia_yago/dbpedia_en.ttl --kg2 ../data/dbpedia_yago/yago_en.ttl --embedding ../data/emb/DBpedia_YAGO/ --output ../save/results/dbpedia_yago.ttl --literal_idf --literal_english_filter --literal_faiss_index hnsw --target_hub_degree_threshold 1000 --workers 48 --bootstrap_workers 48 --subrelation_workers 48
+python main.py --kg1 ../data/DBpedia_YAGO/dbpedia_en.ttl --kg2 ../data/DBpedia_YAGO/yago_en.ttl --embedding ../data/emb/DBpedia_YAGO/ --output ../save/results/dbpedia_yago.ttl --literal_idf --literal_english_filter --literal_faiss_index hnsw --target_hub_degree_threshold 1000 --workers 48 --bootstrap_workers 48 --subrelation_workers 48
